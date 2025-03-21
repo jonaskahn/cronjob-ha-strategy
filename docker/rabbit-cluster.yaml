@@ -1,0 +1,58 @@
+version: '3.8'
+
+services:
+  rabbitmq1:
+    image: rabbitmq:4.0-management
+    hostname: rabbitmq1
+    container_name: rabbitmq1
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      - RABBITMQ_ERLANG_COOKIE=SWQOKODSQALRPCLNMEQG
+      - RABBITMQ_DEFAULT_USER=admin
+      - RABBITMQ_DEFAULT_PASS=admin
+    volumes:
+      - ./config/rabbitmq_plugins:/etc/rabbitmq/enabled_plugins
+    networks:
+      - rabbitmq_network
+
+  rabbitmq2:
+    image: rabbitmq:4.0-management
+    hostname: rabbitmq2
+    container_name: rabbitmq2
+    ports:
+      - "5673:5672"
+      - "15673:15672"
+    environment:
+      - RABBITMQ_ERLANG_COOKIE=SWQOKODSQALRPCLNMEQG
+      - RABBITMQ_DEFAULT_USER=admin
+      - RABBITMQ_DEFAULT_PASS=admin
+    volumes:
+      - ./config/rabbitmq_plugins:/etc/rabbitmq/enabled_plugins
+    depends_on:
+      - rabbitmq1
+    networks:
+      - rabbitmq_network
+
+  rabbitmq3:
+    image: rabbitmq:4.0-management
+    hostname: rabbitmq3
+    container_name: rabbitmq3
+    ports:
+      - "5674:5672"
+      - "15674:15672"
+    environment:
+      - RABBITMQ_ERLANG_COOKIE=SWQOKODSQALRPCLNMEQG
+      - RABBITMQ_DEFAULT_USER=admin
+      - RABBITMQ_DEFAULT_PASS=admin
+    volumes:
+      - ./config/rabbitmq_plugins:/etc/rabbitmq/enabled_plugins
+    depends_on:
+      - rabbitmq1
+    networks:
+      - rabbitmq_network
+
+networks:
+  rabbitmq_network:
+    driver: bridge

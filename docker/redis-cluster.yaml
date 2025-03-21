@@ -1,0 +1,123 @@
+version: '3.8'
+
+services:
+  redis-node-0:
+    image: bitnami/redis-cluster:7.4
+    restart: unless-stopped
+    volumes:
+      - redis-cluster_data-0:/bitnami/redis/data
+    ports:
+      - '6379:6379'
+    networks:
+      redis-cluster-network:
+        ipv4_address: 172.18.0.2  # IP for master of slots 0-5460
+    environment:
+      - 'ALLOW_EMPTY_PASSWORD=yes'
+      - 'REDIS_REPLICATION_MODE=slave'
+      - 'REDIS_NODES=redis-node-0 redis-node-1 redis-node-2 redis-node-3 redis-node-4 redis-node-5'
+
+  redis-node-1:
+    image: bitnami/redis-cluster:7.4
+    restart: unless-stopped
+    volumes:
+      - redis-cluster_data-1:/bitnami/redis/data
+    ports:
+      - '6380:6379'
+    networks:
+      redis-cluster-network:
+        ipv4_address: 172.18.0.3  # IP for master of slots 5461-10922
+    environment:
+      - 'ALLOW_EMPTY_PASSWORD=yes'
+      - 'REDIS_REPLICATION_MODE=slave'
+      - 'REDIS_NODES=redis-node-0 redis-node-1 redis-node-2 redis-node-3 redis-node-4 redis-node-5'
+
+  redis-node-2:
+    image: bitnami/redis-cluster:7.4
+    restart: unless-stopped
+    volumes:
+      - redis-cluster_data-2:/bitnami/redis/data
+    ports:
+      - '6381:6379'
+    networks:
+      redis-cluster-network:
+        ipv4_address: 172.18.0.4  # IP for master of slots 10923-16383
+    environment:
+      - 'ALLOW_EMPTY_PASSWORD=yes'
+      - 'REDIS_REPLICATION_MODE=slave'
+      - 'REDIS_NODES=redis-node-0 redis-node-1 redis-node-2 redis-node-3 redis-node-4 redis-node-5'
+
+
+  redis-node-3:
+    image: bitnami/redis-cluster:7.4
+    restart: unless-stopped
+    volumes:
+      - redis-cluster_data-3:/bitnami/redis/data
+    ports:
+      - '6382:6379'
+    networks:
+      redis-cluster-network:
+        ipv4_address: 172.18.0.5  # IP for slave of master 800b96e0
+    environment:
+      - 'ALLOW_EMPTY_PASSWORD=yes'
+      - 'REDIS_REPLICATION_MODE=master'
+      - 'REDIS_NODES=redis-node-0 redis-node-1 redis-node-2 redis-node-3 redis-node-4 redis-node-5'
+
+  redis-node-4:
+    image: bitnami/redis-cluster:7.4
+    restart: unless-stopped
+    volumes:
+      - redis-cluster_data-4:/bitnami/redis/data
+    ports:
+      - '6383:6379'
+    networks:
+      redis-cluster-network:
+        ipv4_address: 172.18.0.6  # IP for slave of master 9d7fcbfd
+    environment:
+      - 'ALLOW_EMPTY_PASSWORD=yes'
+      - 'REDIS_REPLICATION_MODE=master'
+      - 'REDIS_NODES=redis-node-0 redis-node-1 redis-node-2 redis-node-3 redis-node-4 redis-node-5'
+
+  redis-node-5:
+    image: bitnami/redis-cluster:7.4
+    restart: unless-stopped
+    volumes:
+      - redis-cluster_data-5:/bitnami/redis/data
+    ports:
+      - '6384:6379'
+    networks:
+      redis-cluster-network:
+        ipv4_address: 172.18.0.7  # IP for slave of master cf33edb5
+    depends_on:
+      - redis-node-0
+      - redis-node-1
+      - redis-node-2
+      - redis-node-3
+      - redis-node-4
+    environment:
+      - 'ALLOW_EMPTY_PASSWORD=yes'
+      - 'REDIS_REPLICATION_MODE=master'
+      - 'REDIS_CLUSTER_REPLICAS=1'
+      - 'REDIS_NODES=redis-node-0 redis-node-1 redis-node-2 redis-node-3 redis-node-4 redis-node-5'
+      - 'REDIS_CLUSTER_CREATOR=yes'
+
+networks:
+  redis-cluster-network:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.18.0.0/16  # Define the subnet for fixed IPs
+
+volumes:
+  redis-cluster_data-0:
+    driver: local
+  redis-cluster_data-1:
+    driver: local
+  redis-cluster_data-2:
+    driver: local
+  redis-cluster_data-3:
+    driver: local
+  redis-cluster_data-4:
+    driver: local
+  redis-cluster_data-5:
+    driver: local
