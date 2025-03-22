@@ -7,7 +7,7 @@ redis-cli -h localhost -p 6379  cluster info
 echo "Checking cluster nodes..."
 redis-cli -h localhost -p 6379  cluster nodes
 
-# Function to add test keys with different hash tags
+# Function to add sample keys with different hash tags
 add_test_keys() {
   echo "Adding test keys..."
   # We can add keys through any node in the cluster

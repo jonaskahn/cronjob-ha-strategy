@@ -1,16 +1,16 @@
 import winston from 'winston';
 
-// Console transport format
+// CONSOLE OUTPUT FORMAT
 const consoleFormat = winston.format.combine(
   winston.format.colorize(),
   winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
   winston.format.printf(({ level, message, timestamp, ...meta }) => {
-    const component = formatComponentWithLimit(meta);
-    return `${timestamp} [${level}]:${component}: ${message}`;
+    const name = getFormattedName(meta);
+    return `${timestamp} [${level}]:${name}: ${message}`;
   })
 );
 
-const formatComponentWithLimit = (meta, maxLength = 30) => {
+const getFormattedName = (meta, maxLength = 30) => {
   if (!meta?.component) return ''.padEnd(maxLength);
   const componentStr = `[${meta.component}]`;
   if (componentStr.length <= maxLength) {
@@ -19,9 +19,8 @@ const formatComponentWithLimit = (meta, maxLength = 30) => {
   return componentStr.slice(0, maxLength);
 };
 
-// Create logger instance
 const logger = winston.createLogger({
-  level: process.env.LOG_LEVEL || 'debug',
+  level: process.env.CHJS_LOG_LEVEL || 'debug',
   format: consoleFormat,
   transports: [new winston.transports.Console()],
   exceptionHandlers: [new winston.transports.Console()],
@@ -29,8 +28,8 @@ const logger = winston.createLogger({
   exitOnError: false,
 });
 
-const getLoggerInstance = component => {
-  return logger.child({ component });
+const getLogger = name => {
+  return logger.child({ name });
 };
 
-export default getLoggerInstance;
+export default getLogger;

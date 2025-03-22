@@ -1,12 +1,12 @@
 import redisClient from '../src/client/redisClient.js';
-import getLoggerInstance from './utils/logger.js';
+import getLogger from './utils/logger.js';
 
 // Set environment for local development
 if (!process.env.NODE_ENV) {
   process.env.NODE_ENV = 'development';
 }
 
-const logger = getLoggerInstance('main');
+const logger = getLogger('main');
 logger.info(`Start application with bitnami Redis Cluster in ${process.env.NODE_ENV} mode`);
 
 // Function to check Redis connection and perform operations
@@ -22,16 +22,16 @@ async function runApp() {
     logger.info('Waiting for Redis Cluster to be fully ready...');
     await new Promise(resolve => setTimeout(resolve, 3000)); // Short delay to ensure client events are processed
 
-    // Try to set and get a test key with retries
+    // Try to set and get a sample key with retries
     let retries = 0;
     const maxRetries = 3;
     let success = false;
 
     while (!success && retries < maxRetries) {
       try {
-        await redisClient.set('test', 'test value from app');
+        await redisClient.set('test', 'sample value from app');
         const result = await redisClient.get('test');
-        console.log('Redis Cluster test result:', result);
+        console.log('Redis Cluster sample result:', result);
         success = true;
       } catch (err) {
         retries++;

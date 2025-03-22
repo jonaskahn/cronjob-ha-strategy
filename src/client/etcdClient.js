@@ -1,7 +1,7 @@
-import getLoggerInstance from '../utils/logger.js';
+import getLogger from '../utils/logger.js';
 import { Etcd3 } from 'etcd3';
 
-const logger = getLoggerInstance('client/EtcdClient');
+const logger = getLogger('client/EtcdClient');
 
 class EtcdClient {
   constructor() {
@@ -17,9 +17,9 @@ class EtcdClient {
     });
   }
 
-  async set(key, value) {
+  async set(key, value, lease) {
     try {
-      return await this._client.put(key).value(value);
+      return await this._client.put(key).value(value).lease(lease);
     } catch (error) {
       logger.error(`Error setting key ${key}:`, error);
       throw error;
@@ -53,11 +53,11 @@ class EtcdClient {
     }
   }
 
-  async watch(key, callback) {
+  async watchPrefix(prefix, callback) {
     try {
       return this._client
         .watch()
-        .key(key)
+        .prefix(prefix)
         .create()
         .then(watcher => {
           watcher.on('put', event => {
@@ -69,7 +69,7 @@ class EtcdClient {
           return watcher;
         });
     } catch (error) {
-      logger.error(`Error watching key ${key}:`, error);
+      logger.error(`Error watching prefix ${prefix}:`, error);
       throw error;
     }
   }

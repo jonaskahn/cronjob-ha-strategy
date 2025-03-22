@@ -53,6 +53,22 @@ services:
     networks:
       - rabbitmq_network
 
+  haproxy:
+    image: haproxy:latest
+    container_name: haproxy
+    ports:
+      - "5670:5670"
+      - "15670:15670"
+      - "1936:1936"
+    volumes:
+      - ./config/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      - rabbitmq1
+      - rabbitmq2
+      - rabbitmq3
+    networks:
+      - rabbitmq_network
+
 networks:
   rabbitmq_network:
     driver: bridge

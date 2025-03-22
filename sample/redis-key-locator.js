@@ -177,7 +177,7 @@ async function findKeyLocation(key) {
         )
       );
 
-      // Set a test value
+      // Set a sample value
       const testValue = `Value set at ${new Date().toISOString()}`;
       await cluster.set(key, testValue);
       console.log(colors.green(`\n[SUCCESS] Set key "${key}" to: ${colors.cyan(testValue)}`));

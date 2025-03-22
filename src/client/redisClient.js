@@ -1,7 +1,7 @@
-import getLoggerInstance from '../utils/logger.js';
+import getLogger from '../utils/logger.js';
 import Redis from 'ioredis';
 
-const logger = getLoggerInstance('client/RedisClient');
+const logger = getLogger('client/RedisClient');
 
 class RedisClient {
   constructor() {
