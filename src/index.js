@@ -1,112 +1,269 @@
-import redisClient from '../src/client/redisClient.js';
+// src/index.js
 import getLogger from './utils/logger.js';
+import config from './utils/config.js';
+import rabbitMQClient from './client/rabbitMQClient.js';
+import etcdClient from './client/etcdClient.js';
+import messageTracker from './core/messageTracker.js';
+import stateStorage from './core/storage.js';
+import coordinator from './core/coordinator.js';
+import queueManager from './core/queueManager.js';
+import consumer from './core/consumer.js';
+import publisher from './core/publisher.js';
+import worker from './worker.js';
 
-// Set environment for local development
-if (!process.env.NODE_ENV) {
-  process.env.NODE_ENV = 'development';
-}
+// Import all handler modules
+import './handlers/index.js';
 
 const logger = getLogger('main');
-logger.info(`Start application with bitnami Redis Cluster in ${process.env.NODE_ENV} mode`);
 
-// Function to check Redis connection and perform operations
-async function runApp() {
-  try {
-    // Set a timeout to prevent hanging indefinitely
-    const timeout = setTimeout(() => {
-      logger.error('Redis Cluster connection timed out. Check your Redis cluster configuration.');
-      process.exit(1);
-    }, 15000); // Increased to 15 second timeout
+/**
+ * Main application class that initializes and manages the entire
+ * message processing system.
+ */
+class Application {
+  constructor() {
+    this._config = config;
+    this._running = false;
+    this._shutdownRequested = false;
 
-    // Wait for Redis to be ready
-    logger.info('Waiting for Redis Cluster to be fully ready...');
-    await new Promise(resolve => setTimeout(resolve, 3000)); // Short delay to ensure client events are processed
+    // Core components (using singletons)
+    this._messageTracker = messageTracker;
+    this._stateStorage = stateStorage;
+    this._coordinator = coordinator;
+    this._queueManager = queueManager;
+    this._consumer = consumer;
+    this._publisher = publisher;
+    this._worker = worker;
 
-    // Try to set and get a sample key with retries
-    let retries = 0;
-    const maxRetries = 3;
-    let success = false;
+    // Set up shutdown handlers
+    this._setupShutdownHandlers();
 
-    while (!success && retries < maxRetries) {
-      try {
-        await redisClient.set('test', 'sample value from app');
-        const result = await redisClient.get('test');
-        console.log('Redis Cluster sample result:', result);
-        success = true;
-      } catch (err) {
-        retries++;
-        logger.warn(`Redis test attempt ${retries}/${maxRetries} failed: ${err.message}`);
-        if (retries < maxRetries) {
-          logger.info(`Waiting before retry ${retries + 1}...`);
-          await new Promise(resolve => setTimeout(resolve, 2000));
-        } else {
-          throw err;
-        }
-      }
+    logger.info('Application initialized');
+  }
+
+  /**
+   * Start the application
+   * @param {Object} options - Startup options
+   * @returns {Promise<void>}
+   */
+  async start(options = {}) {
+    if (this._running) {
+      logger.warn('Application already running');
+      return;
     }
 
-    // Try to set and get a few more keys to demonstrate distribution
-    for (let i = 1; i <= 5; i++) {
-      const key = `app:test:key:${i}`;
-      const value = `Value ${i} from application at ${new Date().toISOString()}`;
+    logger.info('Starting application...');
 
+    try {
+      const mode = options.mode || process.env.APP_MODE || 'standalone';
+
+      switch (mode) {
+        case 'worker':
+          await this._startWorkerMode();
+          break;
+        case 'coordinator':
+          await this._startCoordinatorMode();
+          break;
+        case 'publisher':
+          await this._startPublisherMode();
+          break;
+        case 'standalone':
+        default:
+          await this._startStandaloneMode();
+          break;
+      }
+
+      this._running = true;
+      logger.info(`Application started in ${mode} mode`);
+    } catch (error) {
+      logger.error('Failed to start application:', error);
+      await this.shutdown();
+      throw error;
+    }
+  }
+
+  /**
+   * Shutdown the application
+   * @returns {Promise<void>}
+   */
+  async shutdown() {
+    if (!this._running) {
+      return;
+    }
+
+    this._running = false;
+    logger.info('Shutting down application...');
+
+    try {
+      // Shutdown the worker
+      await this._worker.shutdown();
+
+      logger.info('Application shutdown complete');
+    } catch (error) {
+      logger.error('Error during application shutdown:', error);
+    }
+  }
+
+  /**
+   * Start the application in worker mode (consumer only)
+   * @private
+   */
+  async _startWorkerMode() {
+    logger.info('Starting in worker mode...');
+    await this._worker.start();
+
+    // Register state handlers from handler modules
+    this._registerStateHandlers();
+  }
+
+  /**
+   * Start the application in coordinator mode (coordinator only)
+   * @private
+   */
+  async _startCoordinatorMode() {
+    logger.info('Starting in coordinator mode...');
+
+    // Connect to etcd
+    const etcdHealth = await etcdClient.healthCheck();
+    if (etcdHealth.status !== 'ok') {
+      throw new Error(`etcd connection error: ${etcdHealth.message}`);
+    }
+
+    // Register with coordinator to get consumer ID
+    await this._coordinator.register();
+
+    // Retrieve all queues from RabbitMQ
+    await rabbitMQClient.connect();
+    const queues = await rabbitMQClient.listQueues();
+    const queueNames = queues.map(queue => queue.name);
+
+    // Rebalance consumers across queues
+    await this._coordinator.rebalanceConsumers(queueNames);
+
+    // Set up periodic rebalancing
+    setInterval(async () => {
       try {
-        // Try to set the key with retries
-        let setSuccess = false;
-        let setRetries = 0;
-
-        while (!setSuccess && setRetries < 3) {
-          try {
-            await redisClient.set(key, value);
-            setSuccess = true;
-            logger.info(`Set ${key} = ${value}`);
-          } catch (err) {
-            setRetries++;
-            logger.warn(`Failed to set ${key} (attempt ${setRetries}/3): ${err.message}`);
-            if (setRetries < 3) {
-              await new Promise(resolve => setTimeout(resolve, 1000));
-            } else {
-              throw err;
-            }
-          }
-        }
-
-        // Try to get the key with retries
-        let getSuccess = false;
-        let getRetries = 0;
-
-        while (!getSuccess && getRetries < 3) {
-          try {
-            const retrieved = await redisClient.get(key);
-            getSuccess = true;
-            logger.info(`Retrieved ${key} = ${retrieved}`);
-          } catch (err) {
-            getRetries++;
-            logger.warn(`Failed to get ${key} (attempt ${getRetries}/3): ${err.message}`);
-            if (getRetries < 3) {
-              await new Promise(resolve => setTimeout(resolve, 1000));
-            } else {
-              throw err;
-            }
-          }
-        }
+        const currentQueues = await rabbitMQClient.listQueues();
+        const currentQueueNames = currentQueues.map(queue => queue.name);
+        await this._coordinator.rebalanceConsumers(currentQueueNames);
       } catch (error) {
-        logger.error(`Failed operation on key ${key}: ${error.message}`);
+        logger.error('Error during periodic rebalancing:', error);
       }
+    }, 60000); // Rebalance every minute
+  }
+
+  /**
+   * Start the application in publisher mode (publisher only)
+   * @private
+   */
+  async _startPublisherMode() {
+    logger.info('Starting in publisher mode...');
+
+    // Connect to RabbitMQ
+    await rabbitMQClient.connect();
+
+    // Initialize state storage
+    await this._stateStorage.initializeTable();
+  }
+
+  /**
+   * Start the application in standalone mode (all components)
+   * @private
+   */
+  async _startStandaloneMode() {
+    logger.info('Starting in standalone mode...');
+
+    // Start the worker
+    await this._worker.start();
+
+    // Register state handlers from handler modules
+    this._registerStateHandlers();
+  }
+
+  /**
+   * Register all state handlers with the worker
+   * @private
+   */
+  _registerStateHandlers() {
+    // The handlers are imported and registered through the handlers/index.js module
+    logger.info('State handlers registered');
+  }
+
+  /**
+   * Set up graceful shutdown handlers
+   * @private
+   */
+  _setupShutdownHandlers() {
+    // Handle process termination signals
+    process.on('SIGTERM', this._handleShutdownSignal.bind(this));
+    process.on('SIGINT', this._handleShutdownSignal.bind(this));
+
+    // Handle uncaught exceptions
+    process.on('uncaughtException', this._handleUncaughtException.bind(this));
+    process.on('unhandledRejection', this._handleUnhandledRejection.bind(this));
+  }
+
+  /**
+   * Handle shutdown signal
+   * @param {string} signal - Signal name
+   * @private
+   */
+  _handleShutdownSignal(signal) {
+    if (this._shutdownRequested) {
+      return;
     }
 
-    // Clear the timeout since we succeeded
-    clearTimeout(timeout);
+    this._shutdownRequested = true;
+    logger.info(`Received ${signal}. Starting graceful shutdown...`);
 
-    logger.info(
-      'Application running successfully with Redis Cluster - keys are properly distributed'
-    );
-  } catch (error) {
-    logger.error(`Redis Cluster operation failed: ${error.message}`);
-    logger.error('Make sure your Redis Cluster is properly configured and all nodes are running');
-    process.exit(1);
+    this.shutdown()
+      .then(() => {
+        logger.info('Graceful shutdown completed');
+        process.exit(0);
+      })
+      .catch(error => {
+        logger.error('Error during graceful shutdown:', error);
+        process.exit(1);
+      });
+
+    // Force exit after timeout
+    setTimeout(() => {
+      logger.error('Forced shutdown after timeout');
+      process.exit(1);
+    }, 30000); // 30 seconds
+  }
+
+  /**
+   * Handle uncaught exception
+   * @param {Error} error - Error object
+   * @private
+   */
+  _handleUncaughtException(error) {
+    logger.error('Uncaught exception:', error);
+    this._handleShutdownSignal('UNCAUGHT_EXCEPTION');
+  }
+
+  /**
+   * Handle unhandled rejection
+   * @param {Error} reason - Rejection reason
+   * @param {Promise} promise - Rejected promise
+   * @private
+   */
+  _handleUnhandledRejection(reason, promise) {
+    logger.error('Unhandled rejection at:', promise, 'reason:', reason);
   }
 }
 
-// Run the application
-runApp();
+// Create application instance
+const app = new Application();
+
+// Export application
+export default app;
+
+// Start application if running as main module
+if (import.meta.url === import.meta.main) {
+  app.start().catch(error => {
+    logger.error('Application startup failed:', error);
+    process.exit(1);
+  });
+}
