@@ -12,7 +12,7 @@ import publisher from './core/publisher.js';
 import worker from './worker.js';
 
 // Import all handler modules
-import './handlers/index.js';
+import { registerHandlers } from './handlers/index.js';
 
 const logger = getLogger('main');
 
@@ -185,7 +185,8 @@ class Application {
    * @private
    */
   _registerStateHandlers() {
-    // The handlers are imported and registered through the handlers/index.js module
+    // Call the exported registerHandlers function
+    registerHandlers();
     logger.info('State handlers registered');
   }
 

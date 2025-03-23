@@ -1,5 +1,5 @@
 import getLogger from '../utils/logger.js';
-import rabbitMQClient from '../clients/rabbitmq-client.js';
+import rabbitMQClient from '../client/rabbitMQClient.js';
 
 const logger = getLogger('core/Publisher');
 

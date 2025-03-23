@@ -5,6 +5,7 @@ services:
     image: rabbitmq:4.0-management
     hostname: rabbitmq1
     container_name: rabbitmq1
+    restart: unless-stopped
     ports:
       - "5672:5672"
       - "15672:15672"
@@ -21,6 +22,7 @@ services:
     image: rabbitmq:4.0-management
     hostname: rabbitmq2
     container_name: rabbitmq2
+    restart: unless-stopped
     ports:
       - "5673:5672"
       - "15673:15672"
@@ -39,6 +41,7 @@ services:
     image: rabbitmq:4.0-management
     hostname: rabbitmq3
     container_name: rabbitmq3
+    restart: unless-stopped
     ports:
       - "5674:5672"
       - "15674:15672"
@@ -56,6 +59,7 @@ services:
   haproxy:
     image: haproxy:latest
     container_name: haproxy
+    restart: unless-stopped
     ports:
       - "5670:5670"
       - "15670:15670"
