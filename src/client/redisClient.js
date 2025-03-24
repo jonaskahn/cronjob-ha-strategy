@@ -76,7 +76,7 @@ class RedisClient {
         },
       },
       scaleReads: 'all',
-      maxRedirections: 32,
+      maxRedirections: 64,
       retryDelayOnFailover: 100,
       retryDelayOnClusterDown: 500,
       clusterRetryStrategy: times => {

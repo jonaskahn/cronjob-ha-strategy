@@ -1,4 +1,7 @@
 import getLogger from '../utils/logger.js';
+import queueManager from './queueManager.js';
+import messageTracker from './messageTracker.js';
+import stateStorage from './storage.js';
 
 const logger = getLogger('core/Consumer');
 
@@ -10,12 +13,9 @@ const logger = getLogger('core/Consumer');
 class Consumer {
   /**
    * Create a new Consumer instance
-   * @param {Object} queueManager - QueueManager instance
-   * @param {Object} messageTracker - MessageTracker instance
-   * @param {Object} stateStorage - StateStorage instance
    * @param {Object} options - Configuration options
    */
-  constructor(queueManager, messageTracker, stateStorage, options = {}) {
+  constructor(options = {}) {
     if (Consumer.instance) {
       return Consumer.instance;
     }
@@ -264,6 +264,54 @@ class Consumer {
   }
 
   /**
+   * Start consuming messages from all queues
+   * @returns {Promise<void>}
+   */
+  async startConsuming() {
+    try {
+      // Get assigned queues from coordinator
+      const queues = await this._queueManager._coordinator.getAssignedQueues();
+
+      // Start consuming from all assigned queues
+      for (const queue of queues) {
+        await this._queueManager.startConsumingQueue(queue);
+      }
+
+      logger.info('Started consuming messages from assigned queues');
+    } catch (error) {
+      logger.error('Error starting message consumption:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Stop consuming messages from all queues
+   * @returns {Promise<void>}
+   */
+  async stopConsuming() {
+    try {
+      // Get active queues
+      const activeQueues = this._queueManager.getActiveQueues();
+
+      // If no active queues, log and return
+      if (activeQueues.length === 0) {
+        logger.info('No active queues to stop consuming from');
+        return;
+      }
+
+      // Stop consuming from all active queues
+      for (const queue of activeQueues) {
+        await this._queueManager.stopConsumingQueue(queue);
+      }
+
+      logger.info('Stopped consuming messages from all queues');
+    } catch (error) {
+      logger.error('Error stopping message consumption:', error);
+      throw error;
+    }
+  }
+
+  /**
    * Register all handlers with the queue manager
    * @private
    */
@@ -367,4 +415,5 @@ class Consumer {
   }
 }
 
-export default Consumer;
+const consumer = new Consumer();
+export default consumer;

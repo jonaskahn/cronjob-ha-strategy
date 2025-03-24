@@ -407,6 +407,37 @@ class Coordinator {
   }
 
   /**
+   * Explicitly assign queues to this consumer (for testing purposes)
+   * @param {Array<string>} queues - Queue names to assign
+   * @returns {Promise<boolean>} - Success indicator
+   */
+  async assignQueues(queues) {
+    if (!this._consumerId) {
+      logger.warn('Cannot assign queues: Consumer not registered');
+      return false;
+    }
+
+    try {
+      const assignmentKey = `${this._options.queueAssignmentPrefix}${this._consumerId}`;
+      await this._etcdClient.set(assignmentKey, JSON.stringify(queues));
+
+      // Update local cache
+      this._assignedQueues = new Set(queues);
+
+      // Notify listeners
+      this.onAssignmentChanged(queues);
+
+      logger.info(
+        `Explicitly assigned ${queues.length} queues to consumer ${this._consumerId}: ${queues.join(', ')}`
+      );
+      return true;
+    } catch (error) {
+      logger.error(`Error assigning queues to consumer ${this._consumerId}:`, error);
+      return false;
+    }
+  }
+
+  /**
    * Start heartbeat to keep consumer lease alive
    * @private
    */
@@ -531,4 +562,5 @@ class Coordinator {
 }
 
 const coordinator = new Coordinator();
+export { Coordinator };
 export default coordinator;

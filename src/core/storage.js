@@ -14,7 +14,10 @@ class StateStorage {
    * @param {Object} options - Configuration options
    */
   constructor(dbClient, options = {}) {
-    if (StateStorage.instance) {
+    // Add a forceNew option to allow creating a new instance even if a singleton exists
+    const { forceNew, ...restOptions } = options;
+
+    if (StateStorage.instance && !forceNew) {
       return StateStorage.instance;
     }
 
@@ -27,7 +30,7 @@ class StateStorage {
       completedAtColumn: 'completed_at',
       metadataColumn: 'metadata',
       useInMemory: dbClient === null,
-      ...options,
+      ...restOptions,
     };
 
     // Initialize in-memory storage if needed
@@ -632,4 +635,6 @@ class StateStorage {
   }
 }
 
-export default StateStorage;
+const stateStorage = new StateStorage(null);
+export { StateStorage };
+export default stateStorage;

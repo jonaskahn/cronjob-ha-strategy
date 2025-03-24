@@ -312,6 +312,7 @@ class MessageTracker {
   }
 }
 
-// Create singleton instance
+// Export both the class and the singleton instance
 const messageTracker = new MessageTracker();
+export { MessageTracker };
 export default messageTracker;

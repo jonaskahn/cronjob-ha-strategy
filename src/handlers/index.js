@@ -23,11 +23,11 @@ const createTimeoutHandler = (queueName, processingTimeMs = 2000) => {
 };
 
 // Create handlers for each queue
-const customerHandler = createTimeoutHandler('customer', 3000);
-const eventHandler = createTimeoutHandler('event', 1500);
-const emailHandler = createTimeoutHandler('email', 2500);
-const usersHandler = createTimeoutHandler('users', 1000);
-const defaultHandler = createTimeoutHandler('default', 2000);
+const customerHandler = createTimeoutHandler('customer', 30_000);
+const eventHandler = createTimeoutHandler('event', 15_000);
+const emailHandler = createTimeoutHandler('email', 25_000);
+const usersHandler = createTimeoutHandler('users', 10_000);
+const defaultHandler = createTimeoutHandler('default', 20_000);
 
 // Initialize handler exports
 const handlers = {

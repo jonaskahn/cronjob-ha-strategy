@@ -4,13 +4,11 @@ import config from './utils/config.js';
 import redisClient from './client/redisClient.js';
 import rabbitMQClient from './client/rabbitMQClient.js';
 import etcdClient from './client/etcdClient.js';
-// Commenting out this import if databaseClient doesn't exist
-// import databaseClient from './client/databaseClient.js';
-import MessageTracker from './core/messageTracker.js';
-import StateStorage from './core/storage.js';
-import Coordinator from './core/coordinator.js';
-import QueueManager from './core/queueManager.js';
-import Consumer from './core/consumer.js';
+import messageTracker from './core/messageTracker.js';
+import stateStorage from './core/storage.js';
+import coordinator from './core/coordinator.js';
+import queueManager from './core/queueManager.js';
+import consumer from './core/consumer.js';
 
 const logger = getLogger('worker');
 
@@ -27,11 +25,11 @@ class Worker {
     this._shutdownHandled = false;
 
     // Core components will be initialized in start()
-    this._messageTracker = null;
-    this._stateStorage = null;
-    this._coordinator = null;
-    this._queueManager = null;
-    this._consumer = null;
+    this._messageTracker = messageTracker;
+    this._stateStorage = stateStorage;
+    this._coordinator = coordinator;
+    this._queueManager = queueManager;
+    this._consumer = consumer;
 
     // Set up shutdown handlers
     this._setupShutdownHandlers();
@@ -173,8 +171,13 @@ class Worker {
 
     // Initialize state storage if not provided
     if (!this._stateStorage) {
-      // Using null for database client since it's not imported
-      const dbClient = this._config.get('database.useInMemory') ? null : null;
+      // Only use null for database client when in-memory storage is specified
+      let dbClient = null;
+      if (!this._config.get('database.useInMemory')) {
+        logger.warn(
+          'No database client available but in-memory storage not specified. Using in-memory storage by default.'
+        );
+      }
       this._stateStorage = new StateStorage(dbClient, {
         tableName: this._config.get('database.tableName'),
       });
@@ -346,6 +349,7 @@ class Worker {
 const worker = new Worker();
 
 // Export worker
+export { Worker };
 export default worker;
 
 // Start worker if running as main module

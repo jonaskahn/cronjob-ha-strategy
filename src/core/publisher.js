@@ -361,4 +361,5 @@ class Publisher {
 
 // Create and export singleton instance
 const publisher = new Publisher(rabbitMQClient);
+export { Publisher };
 export default publisher;

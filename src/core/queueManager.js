@@ -258,6 +258,42 @@ class QueueManager {
   }
 
   /**
+   * Get queue information including message counts
+   * @param {string} queueName - Queue name
+   * @returns {Promise<Object>} - Queue information
+   */
+  async getQueueInfo(queueName) {
+    try {
+      // Make sure queue exists
+      if (!this._declaredQueues.has(queueName)) {
+        await this._rabbitMQClient.assertQueue(queueName, this._options.defaultQueueOptions);
+        this._declaredQueues.add(queueName);
+      }
+
+      // Get queue information via RabbitMQ client
+      const queueInfo = await this._rabbitMQClient.assertQueue(queueName);
+
+      return {
+        name: queueName,
+        messageCount: queueInfo.messageCount,
+        consumerCount: queueInfo.consumerCount,
+        isConsuming: this._activeConsumers.has(queueName),
+        ...queueInfo,
+      };
+    } catch (error) {
+      logger.error(`Error getting info for queue ${queueName}:`, error);
+      // Return default object with empty values in case of error
+      return {
+        name: queueName,
+        messageCount: 0,
+        consumerCount: 0,
+        isConsuming: false,
+        error: error.message,
+      };
+    }
+  }
+
+  /**
    * Shutdown QueueManager and clean up resources
    * @returns {Promise<void>}
    */
@@ -427,4 +463,5 @@ class QueueManager {
 }
 
 const queueManager = new QueueManager();
+export { QueueManager };
 export default queueManager;
