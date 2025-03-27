@@ -1,4 +1,4 @@
-version: "3"
+version: '3'
 
 services:
   etcd1:
@@ -16,7 +16,7 @@ services:
       - ETCD_INITIAL_CLUSTER_STATE=new
       - ETCD_INITIAL_CLUSTER_TOKEN=etcd-cluster
     ports:
-      - "2379:2379"
+      - '2379:2379'
     networks:
       - etcd-cluster-network
 
@@ -35,7 +35,7 @@ services:
       - ETCD_INITIAL_CLUSTER_STATE=new
       - ETCD_INITIAL_CLUSTER_TOKEN=etcd-cluster
     ports:
-      - "2380:2379"
+      - '2380:2379'
     networks:
       - etcd-cluster-network
 
@@ -54,7 +54,7 @@ services:
       - ETCD_INITIAL_CLUSTER_STATE=new
       - ETCD_INITIAL_CLUSTER_TOKEN=etcd-cluster
     ports:
-      - "2381:2379"
+      - '2381:2379'
     networks:
       - etcd-cluster-network
 

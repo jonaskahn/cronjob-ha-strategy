@@ -3,17 +3,32 @@ import { Etcd3 } from 'etcd3';
 
 const logger = getLogger('client/EtcdClient');
 
-class EtcdClient {
-  constructor() {
-    const clusterHosts = process.env.CHJS_ETCD_CLUSTER_HOST
-      ? process.env.CHJS_ETCD_CLUSTER_HOST.split(',')
-      : ['localhost:2379', 'localhost:2380', 'localhost:2381'];
+/**
+ * Client for interacting with etcd for distributed coordination
+ */
+export default class EtcdClient {
+  /**
+   * Create a new EtcdClient
+   * @param {AppConfig} config - System configuration
+   */
+  constructor(config) {
+    this._config = config.etcd;
+    this._client = this._createClient();
 
-    this._client = new Etcd3({
-      hosts: clusterHosts,
+    logger.info('EtcdClient initialized with hosts:', this._config.clusterHosts);
+  }
+
+  /**
+   * Create the etcd client
+   * @returns {Etcd3} - etcd client instance
+   * @private
+   */
+  _createClient() {
+    return new Etcd3({
+      hosts: this._config.clusterHosts,
       retry: {
-        retries: 3,
-        initialBackoffMs: 300,
+        retries: this._config.retries,
+        initialBackoffMs: this._config.backoff,
       },
     });
   }
@@ -28,7 +43,6 @@ class EtcdClient {
   async set(key, value, lease = null) {
     try {
       const putOp = this._client.put(key).value(value);
-
       if (lease) {
         return await putOp.lease(lease);
       } else {
@@ -159,6 +173,3 @@ class EtcdClient {
     }
   }
 }
-
-const etcdClient = new EtcdClient();
-export default etcdClient;

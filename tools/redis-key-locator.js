@@ -43,13 +43,11 @@ const cluster = new Redis.Cluster(clusterNodes, {
   natMap: natMapping,
 });
 
-// Create the readline interface
 const rl = readline.createInterface({
   input: process.stdin,
   output: process.stdout,
 });
 
-// Function to calculate CRC16 hash (similar to Redis's implementation)
 function crc16(str) {
   let crc = 0;
   for (let i = 0; i < str.length; i++) {
@@ -61,9 +59,7 @@ function crc16(str) {
   return crc;
 }
 
-// Function to calculate keyslot for a key (simplified approximation)
 function calculateSlot(key) {
-  // Extract hashTag if exists {hashTag}
   let hashTag = key;
   const startBrace = key.indexOf('{');
   const endBrace = key.indexOf('}', startBrace);
@@ -72,7 +68,6 @@ function calculateSlot(key) {
     hashTag = key.substring(startBrace + 1, endBrace);
   }
 
-  // Use CRC16 modulo 16384 to simulate Redis keyslot algorithm
   return crc16(hashTag) % 16384;
 }
 
@@ -234,5 +229,4 @@ process.on('SIGINT', async () => {
   process.exit(0);
 });
 
-// Start the application
 startCommandLoop();

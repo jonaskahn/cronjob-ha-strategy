@@ -1,5 +1,4 @@
 import getLogger from '../utils/logger.js';
-import etcdClient from '../client/etcdClient.js';
 import { v4 as uuidv4 } from 'uuid';
 
 const logger = getLogger('core/Coordinator');
@@ -8,25 +7,18 @@ const logger = getLogger('core/Coordinator');
  * Coordinator class responsible for managing consumer distribution and queue assignments
  * based on priority weights. Uses etcd for distributed coordination.
  */
-class Coordinator {
+export default class Coordinator {
   /**
    * Create a new Coordinator instance
-   * @param {Object} options - Configuration options
+   * @param {EtcdClient} etcdClient - etcd client instance
+   * @param {AppConfig} config - System configuration
    */
-  constructor(options = {}) {
-    if (Coordinator.instance) {
-      return Coordinator.instance;
-    }
+  constructor(etcdClient, config) {
     this._etcdClient = etcdClient;
-    this._options = {
-      consumerPrefix: '/rabbitmq-consumers/',
-      queueAssignmentPrefix: '/queue-assignments/',
-      queueConfigPrefix: '/queue-configs/',
-      leaseTTLInSeconds: 30,
-      heartbeatIntervalInMs: 10_000,
-      ...options,
-    };
+    this._config = config;
+    this._options = config.coordinator;
 
+    // State tracking
     this._consumerId = null;
     this._lease = null;
     this._heartbeatInterval = null;
@@ -34,7 +26,6 @@ class Coordinator {
     this._assignedQueues = new Set();
     this._queuePriorities = new Map();
 
-    Coordinator.instance = this;
     logger.info('Coordinator initialized');
   }
 
@@ -46,7 +37,7 @@ class Coordinator {
   async register(consumerId = null) {
     try {
       // Use provided ID or generate one
-      this._consumerId = consumerId || this.#generateConsumerId();
+      this._consumerId = consumerId || this._generateConsumerId();
 
       // Create a lease for this consumer
       this._lease = await this._etcdClient.createLease(this._options.leaseTTLInSeconds);
@@ -63,10 +54,10 @@ class Coordinator {
       );
 
       // Start heartbeat to keep lease alive
-      this.#startHeartbeat();
+      this._startHeartbeat();
 
       // Watch for queue assignments
-      await this.#watchQueueAssignments();
+      await this._watchQueueAssignments();
 
       logger.info(`Registered consumer with ID: ${this._consumerId}`);
       return this._consumerId;
@@ -88,7 +79,7 @@ class Coordinator {
 
     try {
       // Stop heartbeat
-      this.#stopHeartbeat();
+      this._stopHeartbeat();
 
       // Remove consumer registration
       const consumerKey = `${this._options.consumerPrefix}${this._consumerId}`;
@@ -157,8 +148,14 @@ class Coordinator {
         return config.priority;
       }
 
-      // Default priority if not set
-      return 1;
+      // If priority not found in etcd, use config-based calculation
+      const calculatedPriority = this._config.calculateQueuePriority(queueName);
+      this._queuePriorities.set(queueName, calculatedPriority);
+
+      // Store the calculated priority in etcd for future use
+      await this.setQueuePriority(queueName, calculatedPriority);
+
+      return calculatedPriority;
     } catch (error) {
       logger.error(`Error getting priority for queue ${queueName}:`, error);
       return 1; // Default priority on error
@@ -212,104 +209,41 @@ class Coordinator {
    */
   async calculateConsumerDistribution(queues, consumers) {
     try {
-      // Get queue priorities
-      const queuePriorities = {};
-      let totalPriority = 0;
-
-      for (const queue of queues) {
-        const priority = await this.getQueuePriority(queue);
-        queuePriorities[queue] = priority;
-        totalPriority += priority;
-      }
-
-      // Calculate ideal distribution
-      const consumerCount = consumers.length;
+      // Simplified distribution algorithm
       const consumerAssignments = {};
+      const queuePriorities = {};
 
       // Initialize consumer assignments
       for (const consumer of consumers) {
         consumerAssignments[consumer] = [];
       }
 
-      // Handle case where there are more consumers than queues
-      if (consumerCount >= queues.length) {
-        // Calculate how many consumers each queue should get based on priority
-        const queueConsumerCounts = {};
-        let remainingConsumers = consumerCount;
-
-        for (const queue of queues) {
-          // Proportion of consumers for this queue based on priority
-          const proportion = queuePriorities[queue] / totalPriority;
-          // Initial distribution - give at least one consumer to each queue
-          let assignedConsumers = Math.max(1, Math.floor(proportion * consumerCount));
-
-          // Don't assign more consumers than are available
-          assignedConsumers = Math.min(assignedConsumers, remainingConsumers);
-          queueConsumerCounts[queue] = assignedConsumers;
-          remainingConsumers -= assignedConsumers;
-        }
-
-        // Distribute any remaining consumers based on priority
-        while (remainingConsumers > 0) {
-          // Find queue with highest priority per consumer
-          let bestQueue = null;
-          let bestRatio = -1;
-
-          for (const queue of queues) {
-            const priorityPerConsumer = queuePriorities[queue] / queueConsumerCounts[queue];
-            if (priorityPerConsumer > bestRatio) {
-              bestRatio = priorityPerConsumer;
-              bestQueue = queue;
-            }
-          }
-
-          if (bestQueue) {
-            queueConsumerCounts[bestQueue]++;
-            remainingConsumers--;
-          } else {
-            break; // Shouldn't happen, but prevent infinite loop
-          }
-        }
-
-        // Assign consumers to queues based on calculated distribution
-        let consumerIndex = 0;
-        for (const [queue, count] of Object.entries(queueConsumerCounts)) {
-          for (let i = 0; i < count; i++) {
-            const consumer = consumers[consumerIndex % consumerCount];
-            consumerAssignments[consumer].push(queue);
-            consumerIndex++;
-          }
-        }
+      // If no queues or consumers, return empty assignments
+      if (queues.length === 0 || consumers.length === 0) {
+        return consumerAssignments;
       }
-      // Handle case where there are more queues than consumers
+
+      // Get queue priorities
+      for (const queue of queues) {
+        queuePriorities[queue] = await this.getQueuePriority(queue);
+      }
+
+      // Sort queues by priority (highest first)
+      const sortedQueues = [...queues].sort((a, b) => queuePriorities[b] - queuePriorities[a]);
+
+      // Case 1: More consumers than queues - assign each queue to at least one consumer
+      if (consumers.length >= queues.length) {
+        return this._distributeConsumersToQueues(
+          sortedQueues,
+          consumers,
+          queuePriorities,
+          consumerAssignments
+        );
+      }
+      // Case 2: More queues than consumers - distribute queues evenly
       else {
-        // Sort queues by priority (highest first)
-        const sortedQueues = [...queues].sort((a, b) => queuePriorities[b] - queuePriorities[a]);
-
-        // Group low-priority queues together when there are too many queues
-        const highPriorityQueueCount = Math.min(consumerCount, sortedQueues.length);
-        const highPriorityQueues = sortedQueues.slice(0, highPriorityQueueCount);
-        const lowPriorityQueues = sortedQueues.slice(highPriorityQueueCount);
-
-        // Assign one consumer to each high-priority queue
-        for (let i = 0; i < highPriorityQueues.length; i++) {
-          consumerAssignments[consumers[i]].push(highPriorityQueues[i]);
-        }
-
-        // Distribute remaining queues among consumers
-        if (lowPriorityQueues.length > 0) {
-          const chunkedQueues = this.#chunkArray(lowPriorityQueues, consumerCount);
-
-          for (let i = 0; i < chunkedQueues.length; i++) {
-            const consumerIndex = i % consumerCount;
-            for (const queue of chunkedQueues[i]) {
-              consumerAssignments[consumers[consumerIndex]].push(queue);
-            }
-          }
-        }
+        return this._distributeQueuesToConsumers(sortedQueues, consumers, consumerAssignments);
       }
-
-      return consumerAssignments;
     } catch (error) {
       logger.error('Error calculating consumer distribution:', error);
       throw error;
@@ -438,10 +372,157 @@ class Coordinator {
   }
 
   /**
+   * Distribute consumers to queues when there are more consumers than queues
+   * @param {Array<string>} sortedQueues - Queues sorted by priority
+   * @param {Array<string>} consumers - Available consumer IDs
+   * @param {Object} queuePriorities - Map of queue names to priority values
+   * @param {Object} consumerAssignments - Initial assignments object
+   * @returns {Object} - Updated consumer assignments
+   * @private
+   */
+  _distributeConsumersToQueues(sortedQueues, consumers, queuePriorities, consumerAssignments) {
+    // First, make sure each queue has at least one consumer
+    for (let i = 0; i < sortedQueues.length; i++) {
+      const consumerIndex = i % consumers.length;
+      consumerAssignments[consumers[consumerIndex]].push(sortedQueues[i]);
+    }
+
+    // Then distribute remaining consumers based on queue priority
+    let consumerIndex = sortedQueues.length % consumers.length;
+    const remainingConsumers = consumers.length - consumerIndex;
+
+    if (remainingConsumers > 0) {
+      // Create a distribution plan based on priority
+      const queueRatios = {};
+      let totalPriority = 0;
+
+      for (const queue of sortedQueues) {
+        totalPriority += queuePriorities[queue];
+      }
+
+      for (const queue of sortedQueues) {
+        // Calculate target consumer count based on priority
+        const ratio = queuePriorities[queue] / totalPriority;
+        const targetCount = Math.max(1, Math.round(ratio * consumers.length));
+        queueRatios[queue] = {
+          targetCount,
+          currentCount: 1, // Each queue already has one consumer
+        };
+      }
+
+      // Assign remaining consumers to high priority queues first
+      for (let i = 0; i < remainingConsumers; i++) {
+        // Find the queue with the highest priority that needs more consumers
+        let bestQueue = null;
+        let bestDifference = -1;
+
+        for (const queue of sortedQueues) {
+          const ratio = queueRatios[queue];
+          const difference = ratio.targetCount - ratio.currentCount;
+
+          if (difference > 0 && (bestQueue === null || difference > bestDifference)) {
+            bestQueue = queue;
+            bestDifference = difference;
+          }
+        }
+
+        // If no queue needs more consumers, assign to highest priority queue
+        if (bestQueue === null) {
+          bestQueue = sortedQueues[0];
+        }
+
+        // Assign to the consumer
+        consumerAssignments[consumers[consumerIndex]].push(bestQueue);
+        queueRatios[bestQueue].currentCount++;
+
+        consumerIndex = (consumerIndex + 1) % consumers.length;
+      }
+    }
+
+    return consumerAssignments;
+  }
+
+  /**
+   * Distribute queues to consumers when there are more queues than consumers
+   * @param {Array<string>} sortedQueues - Queues sorted by priority
+   * @param {Array<string>} consumers - Available consumer IDs
+   * @param {Object} consumerAssignments - Initial assignments object
+   * @returns {Object} - Updated consumer assignments
+   * @private
+   */
+  _distributeQueuesToConsumers(sortedQueues, consumers, consumerAssignments) {
+    const queuesPerConsumer = Math.ceil(sortedQueues.length / consumers.length);
+
+    // Distribute queues to consumers
+    for (let i = 0; i < sortedQueues.length; i++) {
+      const consumerIndex = Math.floor(i / queuesPerConsumer);
+      if (consumerIndex < consumers.length) {
+        consumerAssignments[consumers[consumerIndex]].push(sortedQueues[i]);
+      } else {
+        // If we have more queues than can be evenly distributed,
+        // assign overflow to the first consumer (which should have highest capacity)
+        consumerAssignments[consumers[0]].push(sortedQueues[i]);
+      }
+    }
+
+    return consumerAssignments;
+  }
+
+  /**
+   * Group queues by priority when there are more queues than consumers
+   * @param {Array<string>} queues - Queue names
+   * @param {Object} queuePriorities - Queue priorities
+   * @param {number} consumerCount - Available consumer count
+   * @returns {Object} - Grouped queues
+   * @private
+   */
+  _groupQueuesByPriority(queues, queuePriorities, consumerCount) {
+    const consumerAssignments = {};
+
+    // Initialize consumer assignments
+    for (let i = 0; i < consumerCount; i++) {
+      consumerAssignments[`consumer-${i}`] = [];
+    }
+
+    // If enough consumers for all queues, assign one-to-one
+    if (queues.length <= consumerCount) {
+      queues.forEach((queue, index) => {
+        consumerAssignments[`consumer-${index}`].push(queue);
+      });
+      return consumerAssignments;
+    }
+
+    // Sort queues by priority (highest first)
+    const sortedQueues = [...queues].sort((a, b) => queuePriorities[b] - queuePriorities[a]);
+
+    // Split into high priority and low priority
+    const highPriorityCount = Math.min(consumerCount, sortedQueues.length);
+    const highPriorityQueues = sortedQueues.slice(0, highPriorityCount);
+    const lowPriorityQueues = sortedQueues.slice(highPriorityCount);
+
+    // Assign high-priority queues first (one per consumer)
+    highPriorityQueues.forEach((queue, index) => {
+      consumerAssignments[`consumer-${index}`].push(queue);
+    });
+
+    // Distribute low-priority queues among available consumers using round-robin
+    lowPriorityQueues.forEach((queue, index) => {
+      const consumerIndex = index % consumerCount;
+      consumerAssignments[`consumer-${consumerIndex}`].push(queue);
+    });
+
+    logger.debug(
+      `Grouped ${lowPriorityQueues.length} low-priority queues among ${consumerCount} consumers`
+    );
+
+    return consumerAssignments;
+  }
+
+  /**
    * Start heartbeat to keep consumer lease alive
    * @private
    */
-  #startHeartbeat() {
+  _startHeartbeat() {
     if (this._heartbeatInterval) {
       clearInterval(this._heartbeatInterval);
     }
@@ -473,7 +554,7 @@ class Coordinator {
    * Stop heartbeat for consumer lease
    * @private
    */
-  #stopHeartbeat() {
+  _stopHeartbeat() {
     if (this._heartbeatInterval) {
       clearInterval(this._heartbeatInterval);
       this._heartbeatInterval = null;
@@ -484,7 +565,7 @@ class Coordinator {
    * Watch for queue assignment changes
    * @private
    */
-  async #watchQueueAssignments() {
+  async _watchQueueAssignments() {
     if (!this._consumerId) {
       logger.warn('Cannot watch assignments: Consumer not registered');
       return;
@@ -526,28 +607,10 @@ class Coordinator {
    * @returns {string} - Generated consumer ID
    * @private
    */
-  #generateConsumerId() {
+  _generateConsumerId() {
     const hostname = process.env.HOSTNAME || 'unknown';
     const timestamp = Date.now();
     return `CONSUMER-${hostname}-${timestamp}-${uuidv4()}`;
-  }
-
-  /**
-   * Split an array into chunks
-   * @param {Array} array - Array to split
-   * @param {number} chunkCount - Number of chunks
-   * @returns {Array<Array>} - Array of chunks
-   * @private
-   */
-  #chunkArray(array, chunkCount) {
-    const chunks = Array(chunkCount)
-      .fill()
-      .map(() => []);
-    array.forEach((item, index) => {
-      const chunkIndex = index % chunkCount;
-      chunks[chunkIndex].push(item);
-    });
-    return chunks;
   }
 
   /**
@@ -556,11 +619,6 @@ class Coordinator {
    * @param {Array<string>} queues - New queue assignments
    */
   onAssignmentChanged(queues) {
-    // This is a placeholder - should be overridden by QueueManager
     logger.debug(`Assignment changed event: ${queues.join(', ')}`);
   }
 }
-
-const coordinator = new Coordinator();
-export { Coordinator };
-export default coordinator;

@@ -1,5 +1,4 @@
 import getLogger from '../utils/logger.js';
-import rabbitMQClient from '../client/rabbitMQClient.js';
 
 const logger = getLogger('core/Publisher');
 
@@ -7,30 +6,25 @@ const logger = getLogger('core/Publisher');
  * Publisher class for sending messages with state transition information
  * to RabbitMQ exchanges and queues.
  */
-class Publisher {
+export default class Publisher {
   /**
    * Create a new Publisher instance
-   * @param {Object} rabbitMQClient - RabbitMQ client instance
-   * @param {Object} options - Configuration options
+   * @param {RabbitMQClient} rabbitMQClient - RabbitMQ client instance
+   * @param {MessageTracker} messageTracker - MessageTracker instance to check for duplicates
+   * @param {AppConfig} config - System configuration
    */
-  constructor(rabbitMQClient, options = {}) {
-    if (Publisher.instance) {
-      return Publisher.instance;
-    }
-
+  constructor(rabbitMQClient, messageTracker, config) {
     this._rabbitMQClient = rabbitMQClient;
+    this._messageTracker = messageTracker;
     this._options = {
-      defaultExchangeType: 'direct',
-      confirmPublish: true,
-      defaultHeaders: {},
-      ...options,
+      defaultExchangeType: config.publisher.defaultExchangeType,
+      confirmPublish: config.publisher.confirmPublish,
+      defaultHeaders: config.publisher.defaultHeaders,
     };
 
     this._exchanges = new Map();
     this._publishCount = 0;
     this._errorCount = 0;
-
-    Publisher.instance = this;
 
     logger.info('Publisher initialized');
   }
@@ -64,49 +58,34 @@ class Publisher {
       publishOptions = {},
     } = options;
 
-    if (!messageId) {
-      throw new Error('Message ID is required for publishing');
-    }
-
-    if (!currentState || !processingState || !nextState) {
-      throw new Error('State information (currentState, processingState, nextState) is required');
-    }
+    this._validatePublishOptions(messageId, currentState, processingState, nextState);
 
     try {
-      // Ensure exchange exists
-      if (exchangeName && !this._exchanges.has(exchangeName)) {
-        await this._rabbitMQClient.assertExchange(exchangeName, exchangeType);
-        this._exchanges.set(exchangeName, exchangeType);
+      if (await this._isDuplicateMessage(messageId, currentState)) {
+        return false;
       }
-
-      // Prepare message content
-      const messageContent = this.#prepareMessageContent(message, {
+      await this._ensureExchangeExists(exchangeName, exchangeType);
+      const messageContent = this._prepareMessageContent(message, {
         messageId,
         currentState,
         processingState,
         nextState,
       });
 
-      // Prepare message headers
-      const messageHeaders = {
-        ...this._options.defaultHeaders,
+      const messageHeaders = this._prepareMessageHeaders({
         ...headers,
-        'x-message-id': String(messageId),
-        'x-current-state': currentState,
-        'x-processing-state': processingState,
-        'x-next-state': nextState,
-        'x-published-at': Date.now(),
-      };
+        messageId,
+        currentState,
+        processingState,
+        nextState,
+      });
 
-      // Prepare publish options
-      const finalPublishOptions = {
-        ...publishOptions,
-        headers: messageHeaders,
-        messageId: String(messageId),
-        persistent: true,
-        timestamp: Date.now(),
-        contentType: this.#getContentType(message),
-      };
+      const finalPublishOptions = this._prepareFinalPublishOptions(
+        publishOptions,
+        messageHeaders,
+        messageId,
+        message
+      );
 
       // Publish the message
       const result = await this._rabbitMQClient.publish(
@@ -154,46 +133,40 @@ class Publisher {
       publishOptions = {},
     } = options;
 
-    if (!messageId) {
-      throw new Error('Message ID is required for publishing');
-    }
-
-    if (!currentState || !processingState || !nextState) {
-      throw new Error('State information (currentState, processingState, nextState) is required');
-    }
+    // Validate required fields
+    this._validatePublishOptions(messageId, currentState, processingState, nextState);
 
     try {
+      // Check for duplicate processing
+      if (await this._isDuplicateMessage(messageId, currentState)) {
+        return false;
+      }
+
       // Ensure queue exists
       await this._rabbitMQClient.assertQueue(queueName);
 
-      // Prepare message content
-      const messageContent = this.#prepareMessageContent(message, {
+      // Prepare message content and options
+      const messageContent = this._prepareMessageContent(message, {
         messageId,
         currentState,
         processingState,
         nextState,
       });
 
-      // Prepare message headers
-      const messageHeaders = {
-        ...this._options.defaultHeaders,
+      const messageHeaders = this._prepareMessageHeaders({
         ...headers,
-        'x-message-id': String(messageId),
-        'x-current-state': currentState,
-        'x-processing-state': processingState,
-        'x-next-state': nextState,
-        'x-published-at': Date.now(),
-      };
+        messageId,
+        currentState,
+        processingState,
+        nextState,
+      });
 
-      // Prepare publish options
-      const finalPublishOptions = {
-        ...publishOptions,
-        headers: messageHeaders,
-        messageId: String(messageId),
-        persistent: true,
-        timestamp: Date.now(),
-        contentType: this.#getContentType(message),
-      };
+      const finalPublishOptions = this._prepareFinalPublishOptions(
+        publishOptions,
+        messageHeaders,
+        messageId,
+        message
+      );
 
       // Send directly to queue
       const result = await this._rabbitMQClient.sendToQueue(
@@ -239,13 +212,71 @@ class Publisher {
       throw new Error('Messages must be a non-empty array');
     }
 
+    // Check for processing statuses in batch for efficiency
+    const messagesToCheck = messages.map(msg => ({
+      messageId: msg.id,
+      processingState: currentState,
+    }));
+
+    const processingStatuses = await this._getProcessingStatusesForBatch(messagesToCheck);
+    return await this._processMessageBatch(
+      messages,
+      processingStatuses,
+      exchangeName,
+      routingKey,
+      currentState,
+      processingState,
+      nextState,
+      options
+    );
+  }
+
+  /**
+   * Get processing statuses for a batch of messages
+   * @param {Array<Object>} messagesToCheck - Array of {messageId, processingState} objects
+   * @returns {Promise<Object>} - Map of messageId to processing status
+   * @private
+   */
+  async _getProcessingStatusesForBatch(messagesToCheck) {
+    const processingStatuses = {};
+
+    if (this._messageTracker) {
+      const batchStatus = await this._messageTracker.batchIsProcessing(messagesToCheck);
+      Object.assign(processingStatuses, batchStatus);
+    }
+
+    return processingStatuses;
+  }
+
+  /**
+   * Process a batch of messages
+   * @param {Array<Object>} messages - Array of message objects
+   * @param {Object} processingStatuses - Map of messageId to processing status
+   * @param {string} exchangeName - Exchange name
+   * @param {string} routingKey - Routing key
+   * @param {string} currentState - Current state for all messages
+   * @param {string} processingState - Processing state for all messages
+   * @param {string} nextState - Next state for all messages
+   * @param {Object} options - Additional options
+   * @returns {Promise<Array<Object>>} - Array of results
+   * @private
+   */
+  async _processMessageBatch(
+    messages,
+    processingStatuses,
+    exchangeName,
+    routingKey,
+    currentState,
+    processingState,
+    nextState,
+    options
+  ) {
     const results = [];
     const exchangeType = options.exchangeType || this._options.defaultExchangeType;
 
     // Ensure exchange exists
-    if (exchangeName && !this._exchanges.has(exchangeName)) {
-      await this._rabbitMQClient.assertExchange(exchangeName, exchangeType);
-      this._exchanges.set(exchangeName, exchangeType);
+    if (exchangeName) {
+      await this._ensureExchangeExists(exchangeName, exchangeType);
     }
 
     // Process each message
@@ -253,6 +284,22 @@ class Publisher {
       try {
         if (!msg.id) {
           throw new Error('Each message must have an id property');
+        }
+
+        // Skip if already processing
+        if (processingStatuses[msg.id]) {
+          logger.warn(
+            `Message ${msg.id} is already being processed in state ${currentState}, skipping`
+          );
+
+          results.push({
+            id: msg.id,
+            success: false,
+            skipped: true,
+            error: 'Message already being processed',
+          });
+
+          continue;
         }
 
         const publishResult = await this.publish({
@@ -309,13 +356,66 @@ class Publisher {
   }
 
   /**
+   * Validate publish options for required fields
+   * @param {string} messageId - Message ID
+   * @param {string} currentState - Current state
+   * @param {string} processingState - Processing state
+   * @param {string} nextState - Next state
+   * @throws {Error} - If required fields are missing
+   * @private
+   */
+  _validatePublishOptions(messageId, currentState, processingState, nextState) {
+    if (!messageId) {
+      throw new Error('Message ID is required for publishing');
+    }
+
+    if (!currentState || !processingState || !nextState) {
+      throw new Error('State information (currentState, processingState, nextState) is required');
+    }
+  }
+
+  /**
+   * Check if a message is a duplicate (already being processed)
+   * @param {string} messageId - Message ID
+   * @param {string} currentState - Current state
+   * @returns {Promise<boolean>} - True if duplicate
+   * @private
+   */
+  async _isDuplicateMessage(messageId, currentState) {
+    if (this._messageTracker) {
+      const isProcessing = await this._messageTracker.isProcessing(messageId, currentState);
+      if (isProcessing) {
+        logger.warn(
+          `Message ${messageId} is already being processed in state ${currentState}, skipping publish`
+        );
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Ensure an exchange exists
+   * @param {string} exchangeName - Exchange name
+   * @param {string} exchangeType - Exchange type
+   * @returns {Promise<void>}
+   * @private
+   */
+  async _ensureExchangeExists(exchangeName, exchangeType) {
+    if (exchangeName && !this._exchanges.has(exchangeName)) {
+      await this._rabbitMQClient.assertExchange(exchangeName, exchangeType);
+      this._exchanges.set(exchangeName, exchangeType);
+    }
+  }
+
+  /**
    * Prepare message content with metadata
    * @param {Object|string|Buffer} message - Message content
    * @param {Object} metadata - Message metadata
    * @returns {Object|string|Buffer} - Prepared message
    * @private
    */
-  #prepareMessageContent(message, metadata) {
+  _prepareMessageContent(message, metadata) {
     // If message is already a buffer or string, return as is
     if (Buffer.isBuffer(message) || typeof message === 'string') {
       return message;
@@ -337,12 +437,52 @@ class Publisher {
   }
 
   /**
+   * Prepare message headers
+   * @param {Object} headers - Headers object
+   * @returns {Object} - Prepared headers
+   * @private
+   */
+  _prepareMessageHeaders(headers) {
+    const { messageId, currentState, processingState, nextState } = headers;
+
+    return {
+      ...this._options.defaultHeaders,
+      ...headers,
+      'x-message-id': String(messageId),
+      'x-current-state': currentState,
+      'x-processing-state': processingState,
+      'x-next-state': nextState,
+      'x-published-at': Date.now(),
+    };
+  }
+
+  /**
+   * Prepare final publish options
+   * @param {Object} publishOptions - Publish options
+   * @param {Object} messageHeaders - Message headers
+   * @param {string} messageId - Message ID
+   * @param {Object|string|Buffer} message - Message content
+   * @returns {Object} - Final publish options
+   * @private
+   */
+  _prepareFinalPublishOptions(publishOptions, messageHeaders, messageId, message) {
+    return {
+      ...publishOptions,
+      headers: messageHeaders,
+      messageId: String(messageId),
+      persistent: true,
+      timestamp: Date.now(),
+      contentType: this._getContentType(message),
+    };
+  }
+
+  /**
    * Determine content type based on message
    * @param {Object|string|Buffer} message - Message content
    * @returns {string} - Content type
    * @private
    */
-  #getContentType(message) {
+  _getContentType(message) {
     if (Buffer.isBuffer(message)) {
       return 'application/octet-stream';
     }
@@ -357,9 +497,40 @@ class Publisher {
 
     return 'application/octet-stream';
   }
-}
 
-// Create and export singleton instance
-const publisher = new Publisher(rabbitMQClient);
-export { Publisher };
-export default publisher;
+  /**
+   * Implement retry for publishing with exponential backoff
+   * @param {Function} publishFunc - Publishing function to retry
+   * @param {number} [maxRetries=3] - Maximum retry attempts
+   * @param {number} [initialDelayMs=100] - Initial delay in milliseconds
+   * @returns {Promise<boolean>} - Success indicator
+   */
+  async publishWithRetry(publishFunc, maxRetries = 3, initialDelayMs = 100) {
+    let retryCount = 0;
+    let lastError = null;
+
+    while (retryCount <= maxRetries) {
+      try {
+        return await publishFunc();
+      } catch (error) {
+        lastError = error;
+        retryCount++;
+
+        if (retryCount > maxRetries) {
+          logger.error(`Publishing failed after ${maxRetries} retries:`, error);
+          break;
+        }
+
+        const delay = initialDelayMs * Math.pow(2, retryCount - 1);
+        logger.warn(
+          `Publish attempt ${retryCount} failed, retrying in ${delay}ms: ${error.message}`
+        );
+
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+
+    // If we got here, all retries failed
+    throw lastError || new Error(`Publishing failed after ${maxRetries} retries`);
+  }
+}

@@ -1,69 +1,67 @@
+// redisClient.js
 import getLogger from '../utils/logger.js';
 import Redis from 'ioredis';
 
 const logger = getLogger('client/RedisClient');
 
-class RedisClient {
-  constructor() {
-    this._client = this.#createClusterClient();
-    this.#setupEventHandlers();
+/**
+ * Client for interacting with Redis for temporary state storage
+ */
+export default class RedisClient {
+  /**
+   * Create a new RedisClient
+   * @param {AppConfig} config - System configuration
+   */
+  constructor(config) {
+    this._config = config.redis;
+    this._client = this._createClusterClient();
+    this._setupEventHandlers();
   }
 
-  #createClusterClient() {
-    const { masterNodes, replicaNodes } = this.#getClusterNodes();
+  /**
+   * Create a Redis cluster client
+   * @returns {Object} Redis cluster client
+   * @private
+   */
+  _createClusterClient() {
+    const { masterNodes, replicaNodes } = this._getClusterNodes();
     const startupNodes = [...masterNodes, ...replicaNodes];
 
     logger.debug(
       `Connecting to Redis Cluster using ${startupNodes.length} nodes: ${JSON.stringify(startupNodes)}`
     );
 
-    return new Redis.Cluster(startupNodes, this.#getClusterOptions());
+    return new Redis.Cluster(startupNodes, this._getClusterOptions());
   }
 
-  #getClusterNodes() {
-    let masterNodes = [];
-    let replicaNodes = [];
+  /**
+   * Get cluster nodes from configuration
+   * @returns {Object} Object containing master and replica nodes
+   * @private
+   */
+  _getClusterNodes() {
+    const masterNodes = this._config.clusterHosts.map(host => {
+      const [hostname, port] = host.split(':');
+      return { host: hostname, port: Number(port) };
+    });
 
-    const redisClusterHost = process.env.CHJS_REDIS_CLUSTER_HOST;
-    if (redisClusterHost) {
-      masterNodes = redisClusterHost.split(',').map(x => {
-        const [host, port] = x.split(':');
-        return { host, port: Number(port) };
-      });
-      logger.info(
-        `Using master nodes from env.CHJS_REDIS_CLUSTER_HOST: ${JSON.stringify(masterNodes)}`
-      );
-    } else {
-      logger.info(`Fallback to default master nodes`);
-      masterNodes = [
-        { host: 'localhost', port: 6382 },
-        { host: 'localhost', port: 6383 },
-        { host: 'localhost', port: 6384 },
-      ];
-    }
+    const replicaNodes = this._config.replicaHosts.map(host => {
+      const [hostname, port] = host.split(':');
+      return { host: hostname, port: Number(port) };
+    });
 
-    const redisClusterReplicaHost = process.env.CHJS_REDIS_CLUSTER_REPLICA_HOST;
-    if (redisClusterReplicaHost) {
-      replicaNodes = redisClusterReplicaHost.split(',').map(x => {
-        const [host, port] = x.split(':');
-        return { host, port: Number(port) };
-      });
-      logger.info(
-        `Using replica nodes from env.CHJS_REDIS_CLUSTER_REPLICA_HOST: ${JSON.stringify(replicaNodes)}`
-      );
-    } else {
-      logger.info(`Fallback to default replica nodes`);
-      replicaNodes = [
-        { host: 'localhost', port: 6379 },
-        { host: 'localhost', port: 6380 },
-        { host: 'localhost', port: 6381 },
-      ];
-    }
+    logger.info(`Using master nodes: ${JSON.stringify(masterNodes)}`);
+    logger.info(`Using replica nodes: ${JSON.stringify(replicaNodes)}`);
 
     return { masterNodes, replicaNodes };
   }
 
-  #getClusterOptions() {
+  /**
+   * Get cluster options for Redis
+   * @returns {Object} Cluster options
+   * @private
+   */
+  _getClusterOptions() {
     return {
       redisOptions: {
         enableAutoPipelining: true,
@@ -89,22 +87,15 @@ class RedisClient {
       refreshAfterSet: true,
       slotsRefreshTimeout: 5000,
       slotsRefreshInterval: 15000,
-      natMap: this.#getNatMapConfig(),
+      natMap: this._config.natMap,
     };
   }
 
-  #getNatMapConfig() {
-    return {
-      '172.18.0.2:6379': { host: 'localhost', port: 6379 },
-      '172.18.0.3:6379': { host: 'localhost', port: 6380 },
-      '172.18.0.4:6379': { host: 'localhost', port: 6381 },
-      '172.18.0.5:6379': { host: 'localhost', port: 6382 },
-      '172.18.0.6:6379': { host: 'localhost', port: 6383 },
-      '172.18.0.7:6379': { host: 'localhost', port: 6384 },
-    };
-  }
-
-  #setupEventHandlers() {
+  /**
+   * Set up event handlers for Redis client
+   * @private
+   */
+  _setupEventHandlers() {
     this._client.on('error', err => {
       logger.error('Redis Cluster Error:', err);
     });
@@ -119,7 +110,7 @@ class RedisClient {
 
     this._client.on('ready', async () => {
       logger.info('Redis Cluster is ready to use');
-      await this.#verifyClusterConnection();
+      await this._verifyClusterConnection();
     });
 
     this._client.on('end', () => {
@@ -135,7 +126,12 @@ class RedisClient {
     });
   }
 
-  async #verifyClusterConnection() {
+  /**
+   * Verify Redis cluster connection
+   * @returns {Promise<void>}
+   * @private
+   */
+  async _verifyClusterConnection() {
     try {
       // Set a health check key
       await this._client.set('cluster:health', 'OK');
@@ -201,20 +197,6 @@ class RedisClient {
   }
 
   /**
-   * Delete multiple keys from Redis in one operation
-   * @param {Array<string>} keys - Keys to delete
-   * @returns {Promise<number>} - Number of keys deleted
-   */
-  async multiDel(keys) {
-    try {
-      return await this._client.del(...keys);
-    } catch (error) {
-      logger.error(`Failed to delete multiple keys: ${error.message}`);
-      throw error;
-    }
-  }
-
-  /**
    * Check if a key exists in Redis
    * @param {string} key - Key to check
    * @returns {Promise<number>} - 1 if exists, 0 if not
@@ -229,42 +211,10 @@ class RedisClient {
   }
 
   /**
-   * Check multiple keys for existence in a single operation
-   * @param {Array<string>} keys - Array of keys to check
-   * @returns {Promise<Object>} - Map of key to existence boolean
-   */
-  async multiExists(keys) {
-    if (!keys || keys.length === 0) {
-      return {};
-    }
-
-    try {
-      // Use pipeline for better performance
-      const pipeline = this._client.pipeline();
-      for (const key of keys) {
-        pipeline.exists(key);
-      }
-
-      const results = await pipeline.exec();
-      const existenceMap = {};
-
-      keys.forEach((key, index) => {
-        // results format is [err, result] for each operation
-        existenceMap[key] = results[index][1] === 1;
-      });
-
-      return existenceMap;
-    } catch (error) {
-      logger.error(`Failed to check multiple keys existence: ${error.message}`);
-      throw error;
-    }
-  }
-
-  /**
    * Set key value with expiration
    * @param {string} key - Key to set
-   * @param {string} value - Value to set
    * @param {number} seconds - Expiration time in seconds
+   * @param {string} value - Value to set
    * @returns {Promise<string>} - Redis response
    */
   async setEx(key, seconds, value) {
@@ -272,58 +222,6 @@ class RedisClient {
       return await this._client.setex(key, seconds, value);
     } catch (error) {
       logger.error(`Failed to set key ${key} with expiration: ${error.message}`);
-      throw error;
-    }
-  }
-
-  /**
-   * Set multiple keys with the same expiration in one operation
-   * @param {Object} keyValues - Object with key-value pairs
-   * @param {number} seconds - Expiration time in seconds for all keys
-   * @returns {Promise<string>} - Redis response
-   */
-  async multiSetEx(keyValues, seconds) {
-    try {
-      // Prepare arguments for the script
-      const args = [];
-      for (const [key, value] of Object.entries(keyValues)) {
-        args.push(key, JSON.stringify(value), seconds.toString());
-      }
-
-      // Execute the multi-set script
-      return await this._client.multiSetEx(args);
-    } catch (error) {
-      logger.error(`Failed to set multiple keys with expiration: ${error.message}`);
-      throw error;
-    }
-  }
-
-  /**
-   * Set expiration on a key
-   * @param {string} key - Key to set expiration on
-   * @param {number} seconds - Expiration time in seconds
-   * @returns {Promise<number>} - 1 if set, 0 if key doesn't exist
-   */
-  async expire(key, seconds) {
-    try {
-      return await this._client.expire(key, seconds);
-    } catch (error) {
-      logger.error(`Failed to set expiration for key ${key}: ${error.message}`);
-      throw error;
-    }
-  }
-
-  /**
-   * Check and set a key only if it doesn't exist
-   * @param {string} key - Key to set
-   * @param {string} value - Value to set
-   * @returns {Promise<number>} - 1 if set, 0 if not set
-   */
-  async setNx(key, value) {
-    try {
-      return await this._client.setnx(key, value);
-    } catch (error) {
-      logger.error(`Failed to set key ${key} if not exists: ${error.message}`);
       throw error;
     }
   }
@@ -338,22 +236,6 @@ class RedisClient {
       return await this._client.mget(keys);
     } catch (error) {
       logger.error(`Failed to get multiple keys: ${error.message}`);
-      throw error;
-    }
-  }
-
-  /**
-   * Execute a Lua script
-   * @param {string} script - Lua script to execute
-   * @param {number} numKeys - Number of keys
-   * @param {Array} args - Script arguments
-   * @returns {Promise<any>} - Script result
-   */
-  async eval(script, numKeys, ...args) {
-    try {
-      return await this._client.eval(script, numKeys, ...args);
-    } catch (error) {
-      logger.error(`Failed to execute Lua script: ${error.message}`);
       throw error;
     }
   }
@@ -394,7 +276,7 @@ class RedisClient {
    */
   async healthCheck() {
     try {
-      const testKey = 'health-check-' + Date.now();
+      const testKey = 'health-check-' + new Date().getTime();
       await this.set(testKey, 'OK');
       const value = await this.get(testKey);
       await this.del(testKey);
@@ -410,6 +292,3 @@ class RedisClient {
     }
   }
 }
-
-const redisClient = new RedisClient();
-export default redisClient;

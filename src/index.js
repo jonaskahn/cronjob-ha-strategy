@@ -1,270 +1,236 @@
-// src/index.js
 import getLogger from './utils/logger.js';
-import config from './utils/config.js';
-import rabbitMQClient from './client/rabbitMQClient.js';
-import etcdClient from './client/etcdClient.js';
-import messageTracker from './core/messageTracker.js';
-import stateStorage from './core/storage.js';
-import coordinator from './core/coordinator.js';
-import queueManager from './core/queueManager.js';
-import consumer from './core/consumer.js';
-import publisher from './core/publisher.js';
-import worker from './worker.js';
 
-// Import all handler modules
-import { registerHandlers } from './handlers/index.js';
+// Import client modules
+import EtcdClient from './client/etcdClient.js';
+import RedisClient from './client/redisClient.js';
+import RabbitMQClient from './client/rabbitMQClient.js';
 
-const logger = getLogger('main');
+import MessageTracker from './core/messageTracker.js';
+import Coordinator from './core/coordinator.js';
+import QueueManager from './core/queueManager.js';
+import Publisher from './core/publisher.js';
+import Consumer from './core/consumer.js';
+import { AppConfig } from './utils/appConfig.js';
+
+const logger = getLogger('application');
 
 /**
- * Main application class that initializes and manages the entire
- * message processing system.
+ * Main application class to manage the message processing system
  */
 class Application {
   constructor() {
-    this._config = config;
-    this._running = false;
-    this._shutdownRequested = false;
+    this.isInitialized = false;
+    this.isShuttingDown = false;
+  }
 
-    // Core components (using singletons)
-    this._messageTracker = messageTracker;
-    this._stateStorage = stateStorage;
-    this._coordinator = coordinator;
-    this._queueManager = queueManager;
-    this._consumer = consumer;
-    this._publisher = publisher;
-    this._worker = worker;
+  /**
+   * Initialize the application components
+   */
+  async initialize() {
+    try {
+      logger.info('Starting application initialization...');
 
-    // Set up shutdown handlers
-    this._setupShutdownHandlers();
+      // Create system configuration
+      this.config = new AppConfig();
+      logger.info('System configuration loaded');
 
-    logger.info('Application initialized');
+      // Initialize clients
+      await this.initializeClients();
+
+      // Initialize core components
+      await this.initializeCoreComponents();
+
+      // Set up signal handlers for graceful shutdown
+      this.setupSignalHandlers();
+
+      this.isInitialized = true;
+      logger.info('Application initialized successfully');
+      return true;
+    } catch (error) {
+      logger.error('Failed to initialize application:', error);
+      await this.shutdown();
+      return false;
+    }
+  }
+
+  /**
+   * Initialize client connections
+   */
+  async initializeClients() {
+    logger.info('Initializing clients...');
+
+    // Create client instances
+    this.etcdClient = new EtcdClient(this.config);
+    this.redisClient = new RedisClient(this.config);
+    this.rabbitMQClient = new RabbitMQClient(this.config);
+
+    // Connect to services
+    logger.info('Connecting to external services...');
+    await this.rabbitMQClient.connect();
+
+    // Check health of connections
+    const rabbitHealth = await this.rabbitMQClient.healthCheck();
+    const redisHealth = await this.redisClient.healthCheck();
+    const etcdHealth = await this.etcdClient.healthCheck();
+
+    if (rabbitHealth.status !== 'ok' || redisHealth.status !== 'ok' || etcdHealth.status !== 'ok') {
+      throw new Error('Service health checks failed. Check logs for details.');
+    }
+
+    logger.info('All clients connected successfully');
+  }
+
+  /**
+   * Initialize core components with dependency injection
+   */
+  async initializeCoreComponents() {
+    logger.info('Initializing core components...');
+
+    this.messageTracker = new MessageTracker(this.redisClient, this.config);
+    this.stateStorage = new StateStorage(this.config);
+    this.coordinator = new Coordinator(this.etcdClient, this.config);
+
+    await this.coordinator.register();
+
+    this.queueManager = new QueueManager(
+      this.rabbitMQClient,
+      this.coordinator,
+      this.messageTracker,
+      this.config
+    );
+
+    this.publisher = new Publisher(this.rabbitMQClient, this.messageTracker, this.config);
+
+    this.consumer = new Consumer(
+      this.queueManager,
+      this.messageTracker,
+      this.stateStorage,
+      this.config
+    );
+
+    await this.consumer.initialize();
+    await this.queueManager.initialize();
+
+    logger.info('Core components initialized successfully');
+  }
+
+  /**
+   * Set up signal handlers for graceful shutdown
+   */
+  setupSignalHandlers() {
+    process.on('SIGTERM', async () => {
+      logger.info('Received SIGTERM signal');
+      await this.shutdown();
+      process.exit(0);
+    });
+
+    process.on('SIGINT', async () => {
+      logger.info('Received SIGINT signal');
+      await this.shutdown();
+      process.exit(0);
+    });
+
+    // Handle uncaught exceptions
+    process.on('uncaughtException', async error => {
+      logger.error('Uncaught exception:', error);
+      await this.shutdown();
+      process.exit(1);
+    });
+
+    // Handle unhandled promise rejections
+    process.on('unhandledRejection', async (reason, promise) => {
+      logger.error('Unhandled promise rejection:', reason);
+      await this.shutdown();
+      process.exit(1);
+    });
   }
 
   /**
    * Start the application
-   * @param {Object} options - Startup options
-   * @returns {Promise<void>}
    */
-  async start(options = {}) {
-    if (this._running) {
-      logger.warn('Application already running');
-      return;
+  async start() {
+    if (!this.isInitialized) {
+      const success = await this.initialize();
+      if (!success) {
+        return false;
+      }
     }
 
-    logger.info('Starting application...');
-
     try {
-      const mode = options.mode || process.env.APP_MODE || 'standalone';
+      logger.info('Starting message consumption...');
+      await this.consumer.startConsuming();
 
-      switch (mode) {
-        case 'worker':
-          await this._startWorkerMode();
-          break;
-        case 'coordinator':
-          await this._startCoordinatorMode();
-          break;
-        case 'publisher':
-          await this._startPublisherMode();
-          break;
-        case 'standalone':
-        default:
-          await this._startStandaloneMode();
-          break;
-      }
-
-      this._running = true;
-      logger.info(`Application started in ${mode} mode`);
+      logger.info('Application started successfully');
+      return true;
     } catch (error) {
       logger.error('Failed to start application:', error);
       await this.shutdown();
-      throw error;
+      return false;
     }
   }
 
   /**
-   * Shutdown the application
-   * @returns {Promise<void>}
+   * Shut down the application gracefully
    */
   async shutdown() {
-    if (!this._running) {
+    if (this.isShuttingDown) {
+      logger.info('Shutdown already in progress');
       return;
     }
 
-    this._running = false;
+    this.isShuttingDown = true;
     logger.info('Shutting down application...');
 
     try {
-      // Shutdown the worker
-      await this._worker.shutdown();
+      // Shutdown in reverse order of initialization
+      if (this.consumer) {
+        logger.info('Stopping consumer...');
+        await this.consumer.shutdown();
+      }
 
-      logger.info('Application shutdown complete');
+      if (this.queueManager) {
+        logger.info('Shutting down queue manager...');
+        await this.queueManager.shutdown();
+      }
+
+      if (this.coordinator) {
+        logger.info('Deregistering from coordinator...');
+        await this.coordinator.deregister();
+      }
+
+      // Close client connections
+      if (this.rabbitMQClient) {
+        logger.info('Closing RabbitMQ connection...');
+        await this.rabbitMQClient.close();
+      }
+
+      if (this.redisClient) {
+        logger.info('Closing Redis connection...');
+        await this.redisClient.quit();
+      }
+
+      if (this.etcdClient) {
+        logger.info('Closing etcd connection...');
+        await this.etcdClient.close();
+      }
+
+      logger.info('Application shutdown completed successfully');
     } catch (error) {
       logger.error('Error during application shutdown:', error);
-    }
-  }
-
-  /**
-   * Start the application in worker mode (consumer only)
-   * @private
-   */
-  async _startWorkerMode() {
-    logger.info('Starting in worker mode...');
-    await this._worker.start();
-
-    // Register state handlers from handler modules
-    this._registerStateHandlers();
-  }
-
-  /**
-   * Start the application in coordinator mode (coordinator only)
-   * @private
-   */
-  async _startCoordinatorMode() {
-    logger.info('Starting in coordinator mode...');
-
-    // Connect to etcd
-    const etcdHealth = await etcdClient.healthCheck();
-    if (etcdHealth.status !== 'ok') {
-      throw new Error(`etcd connection error: ${etcdHealth.message}`);
-    }
-
-    // Register with coordinator to get consumer ID
-    await this._coordinator.register();
-
-    // Retrieve all queues from RabbitMQ
-    await rabbitMQClient.connect();
-    const queues = await rabbitMQClient.listQueues();
-    const queueNames = queues.map(queue => queue.name);
-
-    // Rebalance consumers across queues
-    await this._coordinator.rebalanceConsumers(queueNames);
-
-    // Set up periodic rebalancing
-    setInterval(async () => {
-      try {
-        const currentQueues = await rabbitMQClient.listQueues();
-        const currentQueueNames = currentQueues.map(queue => queue.name);
-        await this._coordinator.rebalanceConsumers(currentQueueNames);
-      } catch (error) {
-        logger.error('Error during periodic rebalancing:', error);
-      }
-    }, 60000); // Rebalance every minute
-  }
-
-  /**
-   * Start the application in publisher mode (publisher only)
-   * @private
-   */
-  async _startPublisherMode() {
-    logger.info('Starting in publisher mode...');
-
-    // Connect to RabbitMQ
-    await rabbitMQClient.connect();
-
-    // Initialize state storage
-    await this._stateStorage.initializeTable();
-  }
-
-  /**
-   * Start the application in standalone mode (all components)
-   * @private
-   */
-  async _startStandaloneMode() {
-    logger.info('Starting in standalone mode...');
-
-    // Start the worker
-    await this._worker.start();
-
-    // Register state handlers from handler modules
-    this._registerStateHandlers();
-  }
-
-  /**
-   * Register all state handlers with the worker
-   * @private
-   */
-  _registerStateHandlers() {
-    // Call the exported registerHandlers function
-    registerHandlers();
-    logger.info('State handlers registered');
-  }
-
-  /**
-   * Set up graceful shutdown handlers
-   * @private
-   */
-  _setupShutdownHandlers() {
-    // Handle process termination signals
-    process.on('SIGTERM', this._handleShutdownSignal.bind(this));
-    process.on('SIGINT', this._handleShutdownSignal.bind(this));
-
-    // Handle uncaught exceptions
-    process.on('uncaughtException', this._handleUncaughtException.bind(this));
-    process.on('unhandledRejection', this._handleUnhandledRejection.bind(this));
-  }
-
-  /**
-   * Handle shutdown signal
-   * @param {string} signal - Signal name
-   * @private
-   */
-  _handleShutdownSignal(signal) {
-    if (this._shutdownRequested) {
-      return;
-    }
-
-    this._shutdownRequested = true;
-    logger.info(`Received ${signal}. Starting graceful shutdown...`);
-
-    this.shutdown()
-      .then(() => {
-        logger.info('Graceful shutdown completed');
-        process.exit(0);
-      })
-      .catch(error => {
-        logger.error('Error during graceful shutdown:', error);
-        process.exit(1);
-      });
-
-    // Force exit after timeout
-    setTimeout(() => {
-      logger.error('Forced shutdown after timeout');
+      // Force exit in case of shutdown errors
       process.exit(1);
-    }, 30000); // 30 seconds
-  }
-
-  /**
-   * Handle uncaught exception
-   * @param {Error} error - Error object
-   * @private
-   */
-  _handleUncaughtException(error) {
-    logger.error('Uncaught exception:', error);
-    this._handleShutdownSignal('UNCAUGHT_EXCEPTION');
-  }
-
-  /**
-   * Handle unhandled rejection
-   * @param {Error} reason - Rejection reason
-   * @param {Promise} promise - Rejected promise
-   * @private
-   */
-  _handleUnhandledRejection(reason, promise) {
-    logger.error('Unhandled rejection at:', promise, 'reason:', reason);
+    }
   }
 }
 
-// Create application instance
+// Create and export application instance
 const app = new Application();
-
-// Export application
 export default app;
 
-// Start application if running as main module
+// Start the application if this is the main entry point
 if (import.meta.url === import.meta.main) {
   app.start().catch(error => {
-    logger.error('Application startup failed:', error);
+    console.error('Fatal error during application startup:', error);
     process.exit(1);
   });
 }

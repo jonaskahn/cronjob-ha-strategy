@@ -7,8 +7,8 @@ services:
     container_name: rabbitmq1
     restart: unless-stopped
     ports:
-      - "5672:5672"
-      - "15672:15672"
+      - '5672:5672'
+      - '15672:15672'
     environment:
       - RABBITMQ_ERLANG_COOKIE=SWQOKODSQALRPCLNMEQG
       - RABBITMQ_DEFAULT_USER=admin
@@ -24,8 +24,8 @@ services:
     container_name: rabbitmq2
     restart: unless-stopped
     ports:
-      - "5673:5672"
-      - "15673:15672"
+      - '5673:5672'
+      - '15673:15672'
     environment:
       - RABBITMQ_ERLANG_COOKIE=SWQOKODSQALRPCLNMEQG
       - RABBITMQ_DEFAULT_USER=admin
@@ -43,8 +43,8 @@ services:
     container_name: rabbitmq3
     restart: unless-stopped
     ports:
-      - "5674:5672"
-      - "15674:15672"
+      - '5674:5672'
+      - '15674:15672'
     environment:
       - RABBITMQ_ERLANG_COOKIE=SWQOKODSQALRPCLNMEQG
       - RABBITMQ_DEFAULT_USER=admin
@@ -61,9 +61,9 @@ services:
     container_name: haproxy
     restart: unless-stopped
     ports:
-      - "5670:5670"
-      - "15670:15670"
-      - "1936:1936"
+      - '5670:5670'
+      - '15670:15670'
+      - '1936:1936'
     volumes:
       - ./config/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     depends_on:

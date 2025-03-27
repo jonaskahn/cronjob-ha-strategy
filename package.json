@@ -1,7 +1,7 @@
 {
   "name": "cronjob-ha-strategy",
   "version": "1.0.0",
-  "description": "Making cronjob with HA in hight throughput environment",
+  "description": "Making cronjob with HA in high throughput environment",
   "author": "JonasKahn",
   "license": "MIT",
   "main": "src/index.js",
@@ -9,7 +9,7 @@
   "scripts": {
     "dev": "nodemon -r dotenv/config src/index.js dotenv_config_debug=truepr",
     "start": "node -r dotenv/config src/index.js",
-    "test:publisher": "node -r dotenv/config src/test-publisher.js",
+    "test:publisher": "node -r dotenv/config tests/integration/test-publisher.js",
     "test": "NODE_OPTIONS=--experimental-vm-modules jest",
     "test:watch": "NODE_OPTIONS=--experimental-vm-modules jest --watch",
     "test:coverage": "NODE_OPTIONS=--experimental-vm-modules jest --coverage",

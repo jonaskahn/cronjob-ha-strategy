@@ -1,7 +1,5 @@
+// consumer.js
 import getLogger from '../utils/logger.js';
-import queueManager from './queueManager.js';
-import messageTracker from './messageTracker.js';
-import stateStorage from './storage.js';
 
 const logger = getLogger('core/Consumer');
 
@@ -10,26 +8,22 @@ const logger = getLogger('core/Consumer');
  * Registers state-specific handlers and coordinates with QueueManager
  * and MessageTracker for message processing.
  */
-class Consumer {
+export default class Consumer {
   /**
    * Create a new Consumer instance
-   * @param {Object} options - Configuration options
+   * @param {QueueManager} queueManager - QueueManager instance
+   * @param {MessageTracker} messageTracker - MessageTracker instance
+   * @param {AppConfig} config - System configuration
    */
-  constructor(options = {}) {
-    if (Consumer.instance) {
-      return Consumer.instance;
-    }
-
+  constructor(queueManager, messageTracker, config) {
     this._queueManager = queueManager;
     this._messageTracker = messageTracker;
-    this._stateStorage = stateStorage;
     this._options = {
-      maxConcurrent: 100, // Maximum concurrent messages
-      verifyFinalState: true, // Verify final state in database
-      retryDelay: 1000, // Retry delay in ms
-      maxRetries: 3, // Maximum retry attempts
-      monitorInterval: 60000, // Monitor interval in ms (1 minute)
-      ...options,
+      maxConcurrent: config.consumer.maxConcurrent,
+      verifyFinalState: config.consumer.verifyFinalState,
+      retryDelay: config.consumer.retryDelay,
+      maxRetries: config.consumer.maxRetries,
+      monitorInterval: config.consumer.monitorInterval,
     };
 
     this._stateHandlers = new Map();
@@ -39,14 +33,7 @@ class Consumer {
     this._errorCount = 0;
     this._monitorInterval = null;
 
-    Consumer.instance = this;
-
     logger.info('Consumer initialized with options:', this._options);
-
-    // Register handlers with queue manager
-    this.#registerHandlersWithQueueManager();
-    // Start monitoring
-    this.#startMonitoring();
   }
 
   /**
@@ -55,10 +42,15 @@ class Consumer {
    */
   async initialize() {
     try {
-      // Verify state storage is initialized
       if (this._options.verifyFinalState) {
         await this._stateStorage.initializeTable();
       }
+
+      // Register handlers with queue manager
+      this._registerHandlersWithQueueManager();
+
+      // Start monitoring
+      this._startMonitoring();
 
       logger.info('Consumer initialized successfully');
     } catch (error) {
@@ -84,11 +76,11 @@ class Consumer {
       throw new Error('Handler must be a function');
     }
 
-    const stateKey = this.#getStateTransitionKey(currentState, processingState, nextState);
+    const stateKey = this._getStateTransitionKey(currentState, processingState, nextState);
     this._stateHandlers.set(stateKey, handler);
 
     // Register with queue manager if already initialized
-    this.#registerHandlerWithQueueManager(currentState, processingState, nextState);
+    this._registerHandlerWithQueueManager(currentState, processingState, nextState);
 
     logger.info(
       `Registered handler for state transition: ${currentState} -> ${processingState} -> ${nextState}`
@@ -104,7 +96,7 @@ class Consumer {
    * @returns {boolean} - Success indicator
    */
   unregisterStateHandler(currentState, processingState, nextState) {
-    const stateKey = this.#getStateTransitionKey(currentState, processingState, nextState);
+    const stateKey = this._getStateTransitionKey(currentState, processingState, nextState);
     const result = this._stateHandlers.delete(stateKey);
 
     if (result) {
@@ -122,6 +114,7 @@ class Consumer {
 
   /**
    * Process a message with the appropriate state handler
+   * This is the core message processing method that implements the state transition flow
    * @param {Object} message - Message content
    * @param {Object} metadata - Message metadata
    * @returns {Promise<boolean>} - Success indicator
@@ -142,13 +135,40 @@ class Consumer {
       await new Promise(resolve => setTimeout(resolve, this._options.retryDelay));
     }
 
-    const stateKey = this.#getStateTransitionKey(currentState, processingState, nextState);
+    const stateKey = this._getStateTransitionKey(currentState, processingState, nextState);
 
     // Check if we have a handler for this state transition
     if (!this._stateHandlers.has(stateKey)) {
       logger.warn(`No handler found for state transition: ${stateKey}`);
       return false;
     }
+
+    // Check if message is already being processed in Redis
+    const isProcessing = await this._messageTracker.isProcessing(messageId, currentState);
+    if (isProcessing) {
+      logger.warn(
+        `Message ${messageId} already being processed in state ${currentState}, skipping`
+      );
+      return false;
+    }
+
+    // Check if already completed in database (if verification enabled)
+    if (this._options.verifyFinalState) {
+      const finalState = await this._stateStorage.getFinalState(messageId, currentState);
+      if (finalState) {
+        logger.info(
+          `Message ${messageId} already completed state transition to ${finalState.nextState}, skipping`
+        );
+        return true;
+      }
+    }
+
+    // Mark as processing in Redis
+    await this._messageTracker.createProcessingState(messageId, currentState, {
+      processingState,
+      nextState,
+      startedAt: Date.now(),
+    });
 
     // Track active processing
     this._processingCount++;
@@ -183,6 +203,9 @@ class Consumer {
         });
       }
 
+      // Delete processing state in Redis
+      await this._messageTracker.deleteProcessingState(messageId, currentState);
+
       // Update success counter
       this._successCount++;
 
@@ -194,6 +217,9 @@ class Consumer {
       // Update error counter
       this._errorCount++;
 
+      // Delete processing state on error
+      await this._messageTracker.deleteProcessingState(messageId, currentState);
+
       logger.error(`Error processing message ${messageId}:`, error);
       return false;
     } finally {
@@ -201,6 +227,210 @@ class Consumer {
       this._processingCount--;
       this._activeProcessing.delete(processingKey);
     }
+  }
+
+  /**
+   * Batch process multiple messages
+   * @param {Array<Object>} messages - Array of message objects with content and metadata
+   * @returns {Promise<Object>} - Map of messageId to success status
+   */
+  async batchProcessMessages(messages) {
+    if (!messages || !messages.length) return {};
+
+    const results = {};
+    const processingInfos = [];
+
+    try {
+      // First check which messages we can process (not at capacity, have handlers, not already processing)
+      const availableSlotsCount = this._options.maxConcurrent - this._processingCount;
+
+      if (availableSlotsCount <= 0) {
+        logger.warn(
+          `Maximum concurrent processing limit (${this._options.maxConcurrent}) reached, delaying batch`
+        );
+        await new Promise(resolve => setTimeout(resolve, this._options.retryDelay));
+
+        // After delay, check again how many slots we have
+        const newAvailableSlotsCount = this._options.maxConcurrent - this._processingCount;
+        if (newAvailableSlotsCount <= 0) {
+          // Still no capacity
+          for (const msg of messages) {
+            results[msg.metadata.messageId] = false;
+          }
+          return results;
+        }
+      }
+
+      // Process our batch allocation in steps for better clarity
+      const messagesToProcess = await this._identifyMessagesToProcess(messages, results);
+      const processingStatuses = await this._checkProcessingStatus(messagesToProcess);
+      const readyMessages = await this._prepareMessagesForProcessing(
+        messagesToProcess,
+        processingStatuses,
+        results,
+        processingInfos
+      );
+
+      // Process the messages that are ready
+      await this._executeMessageProcessing(readyMessages, processingInfos, results);
+
+      return results;
+    } catch (error) {
+      logger.error('Error in batch message processing:', error);
+
+      // Mark all as failed
+      for (const info of processingInfos) {
+        results[info.metadata.messageId] = false;
+      }
+
+      return results;
+    }
+  }
+
+  /**
+   * Identify which messages can be processed based on handlers
+   * @param {Array<Object>} messages - Array of message objects
+   * @param {Object} results - Results object to be updated
+   * @returns {Array<Object>} - Filtered messages that can be processed
+   * @private
+   */
+  async _identifyMessagesToProcess(messages, results) {
+    const messagesToProcess = [];
+
+    for (const msg of messages) {
+      const { messageId, currentState, processingState, nextState } = msg.metadata;
+
+      // Check if we have a handler for this state transition
+      const stateKey = this._getStateTransitionKey(currentState, processingState, nextState);
+      if (!this._stateHandlers.has(stateKey)) {
+        logger.warn(`No handler found for state transition: ${stateKey}`);
+        results[messageId] = false;
+        continue;
+      }
+
+      messagesToProcess.push(msg);
+    }
+
+    return messagesToProcess;
+  }
+
+  /**
+   * Check which messages are already being processed
+   * @param {Array<Object>} messagesToProcess - Messages that can be processed
+   * @returns {Object} - Map of messageId to processing status
+   * @private
+   */
+  async _checkProcessingStatus(messagesToProcess) {
+    const messageInfos = messagesToProcess.map(msg => ({
+      messageId: msg.metadata.messageId,
+      processingState: msg.metadata.currentState,
+    }));
+
+    return await this._messageTracker.batchIsProcessing(messageInfos);
+  }
+
+  /**
+   * Prepare messages for processing by creating processing states
+   * @param {Array<Object>} messagesToProcess - Messages that can be processed
+   * @param {Object} processingStatuses - Map of messageId to processing status
+   * @param {Object} results - Results object to be updated
+   * @param {Array<Object>} processingInfos - Array to store processing info
+   * @returns {Array<Object>} - Messages ready for processing
+   * @private
+   */
+  async _prepareMessagesForProcessing(
+    messagesToProcess,
+    processingStatuses,
+    results,
+    processingInfos
+  ) {
+    const messagesToCreateState = [];
+
+    for (const msg of messagesToProcess) {
+      const { messageId, currentState } = msg.metadata;
+
+      if (processingStatuses[messageId]) {
+        logger.warn(
+          `Message ${messageId} already being processed in state ${currentState}, skipping`
+        );
+        results[messageId] = false;
+        continue;
+      }
+
+      messagesToCreateState.push({
+        messageId,
+        processingState: currentState,
+        metadata: {
+          processingState: msg.metadata.processingState,
+          nextState: msg.metadata.nextState,
+          startedAt: Date.now(),
+        },
+      });
+
+      processingInfos.push({
+        message: msg.content,
+        metadata: msg.metadata,
+      });
+    }
+
+    // Create processing states in batch
+    const createResults =
+      await this._messageTracker.batchCreateProcessingStates(messagesToCreateState);
+    return { createResults, processingInfos };
+  }
+
+  /**
+   * Execute message processing for the prepared messages
+   * @param {Object} readyMessages - Object containing createResults and processingInfos
+   * @param {Array<Object>} processingInfos - Array of processing info objects
+   * @param {Object} results - Results object to be updated
+   * @returns {Promise<void>}
+   * @private
+   */
+  async _executeMessageProcessing(readyMessages, processingInfos, results) {
+    const { createResults } = readyMessages;
+    const processingPromises = [];
+
+    for (const info of processingInfos) {
+      const { messageId } = info.metadata;
+
+      if (createResults[messageId]) {
+        // Increment processing count
+        this._processingCount++;
+
+        // Add to active processing tracking
+        const processingKey = `${messageId}:${info.metadata.currentState}`;
+        this._activeProcessing.set(processingKey, {
+          ...info.metadata,
+          startedAt: Date.now(),
+        });
+
+        // Process the message
+        processingPromises.push(
+          this.processMessage(info.message, info.metadata)
+            .then(success => {
+              results[messageId] = success;
+              if (success) this._successCount++;
+              else this._errorCount++;
+            })
+            .catch(error => {
+              logger.error(`Error in batch processing message ${messageId}:`, error);
+              results[messageId] = false;
+              this._errorCount++;
+            })
+            .finally(() => {
+              // Clean up tracking
+              this._processingCount--;
+              this._activeProcessing.delete(processingKey);
+            })
+        );
+      } else {
+        results[messageId] = false;
+      }
+    }
+
+    // Wait for all processing to complete
+    await Promise.all(processingPromises);
   }
 
   /**
@@ -315,11 +545,11 @@ class Consumer {
    * Register all handlers with the queue manager
    * @private
    */
-  #registerHandlersWithQueueManager() {
+  _registerHandlersWithQueueManager() {
     // Register each state handler with the queue manager
     for (const [stateKey, handler] of this._stateHandlers.entries()) {
       const [currentState, processingState, nextState] = stateKey.split(':');
-      this.#registerHandlerWithQueueManager(currentState, processingState, nextState);
+      this._registerHandlerWithQueueManager(currentState, processingState, nextState);
     }
   }
 
@@ -330,7 +560,7 @@ class Consumer {
    * @param {string} nextState - Next state
    * @private
    */
-  #registerHandlerWithQueueManager(currentState, processingState, nextState) {
+  _registerHandlerWithQueueManager(currentState, processingState, nextState) {
     if (this._queueManager) {
       // Wrap the handler to use our processMessage method
       const wrappedHandler = async (message, metadata) => {
@@ -359,13 +589,13 @@ class Consumer {
    * Start monitoring active processes
    * @private
    */
-  #startMonitoring() {
+  _startMonitoring() {
     if (this._monitorInterval) {
       clearInterval(this._monitorInterval);
     }
 
     this._monitorInterval = setInterval(() => {
-      this.#monitorActiveProcessing();
+      this._monitorActiveProcessing();
     }, this._options.monitorInterval);
 
     logger.debug(`Started monitoring interval (${this._options.monitorInterval}ms)`);
@@ -375,7 +605,7 @@ class Consumer {
    * Monitor active processing for stuck or long-running tasks
    * @private
    */
-  #monitorActiveProcessing() {
+  _monitorActiveProcessing() {
     const now = Date.now();
     const longRunningThreshold = 5 * 60 * 1000; // 5 minutes
 
@@ -403,6 +633,46 @@ class Consumer {
   }
 
   /**
+   * Implement message retry with exponential backoff
+   * @param {string} messageId - Message ID
+   * @param {string} currentState - Current state
+   * @param {Function} retryFunction - Function to retry
+   * @param {number} [initialDelayMs=1000] - Initial delay in milliseconds
+   * @param {number} [maxAttempts=3] - Maximum retry attempts
+   * @returns {Promise<any>} - Result of successful attempt or last error
+   */
+  async retryWithBackoff(
+    messageId,
+    currentState,
+    retryFunction,
+    initialDelayMs = 1000,
+    maxAttempts = 3
+  ) {
+    let attempts = 0;
+    let lastError = null;
+
+    while (attempts < maxAttempts) {
+      attempts++;
+      try {
+        return await retryFunction();
+      } catch (error) {
+        lastError = error;
+        logger.warn(
+          `Retry ${attempts}/${maxAttempts} failed for message ${messageId}: ${error.message}`
+        );
+
+        if (attempts < maxAttempts) {
+          const delayMs = initialDelayMs * Math.pow(2, attempts - 1);
+          logger.debug(`Waiting ${delayMs}ms before next retry for message ${messageId}`);
+          await new Promise(resolve => setTimeout(resolve, delayMs));
+        }
+      }
+    }
+
+    throw lastError || new Error(`All ${maxAttempts} retry attempts failed`);
+  }
+
+  /**
    * Get state transition key
    * @param {string} currentState - Current state
    * @param {string} processingState - Processing state
@@ -410,10 +680,7 @@ class Consumer {
    * @returns {string} - State key
    * @private
    */
-  #getStateTransitionKey(currentState, processingState, nextState) {
+  _getStateTransitionKey(currentState, processingState, nextState) {
     return `${currentState}:${processingState}:${nextState}`;
   }
 }
-
-const consumer = new Consumer();
-export default consumer;

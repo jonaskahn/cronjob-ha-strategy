@@ -4,43 +4,31 @@ import amqp from 'amqplib';
 const logger = getLogger('client/RabbitMQClient');
 
 /**
- * Singleton RabbitMQ client with support for multiple exchange types
+ * RabbitMQ client with support for multiple exchange types
  * and message deduplication
  */
-class RabbitMQClient {
-  constructor() {
+export default class RabbitMQClient {
+  /**
+   * Create a new RabbitMQ client
+   * @param {AppConfig} config - System configuration
+   */
+  constructor(config) {
+    this._config = config.rabbitmq;
     this._client = null;
     this._reconnecting = false;
     this._connected = false;
-    this._config = this.#loadConfiguration();
     this._channels = new Map();
     this._consumers = new Map();
     this._publishChannel = null;
     this._exchangeTypes = new Set(['direct', 'topic', 'fanout', 'headers']);
     this._declaredExchanges = new Set();
     this._boundQueues = new Map();
-  }
 
-  #loadConfiguration() {
-    return {
-      connectionUrl: process.env.CHJS_RABBITMQ_CLUSTER_HOST || 'admin:admin@localhost:5672',
-      heartbeat: Number(process.env.CHJS_RABBITMQ_CLUSTER_HEARTBEAT) || 5000,
-      managerHost: process.env.CHJS_RABBITMQ_MANAGER_HOST || 'admin:admin@localhost:15672',
-      prefetch: Number(process.env.CHJS_RABBITMQ_PREFETCH) || 10,
-      defaultExchangeType: process.env.CHJS_RABBITMQ_DEFAULT_EXCHANGE_TYPE || 'topic',
-      defaultExchangeOptions: {
-        durable: true,
-        autoDelete: false,
-      },
-      defaultQueueOptions: {
-        durable: true,
-        autoDelete: false,
-      },
-    };
+    logger.info('RabbitMQ client initialized');
   }
 
   /**
-   * Establish connection to RabbitMQ (only connects once)
+   * Establish connection to RabbitMQ
    * @returns {Promise<void>}
    */
   async connect() {
@@ -58,7 +46,7 @@ class RabbitMQClient {
       this._client.on('error', async err => {
         logger.error('RabbitMQ connection error:', err);
         this._connected = false;
-        await this.#reconnect();
+        await this._reconnect();
       });
 
       this._client.on('close', () => {
@@ -77,17 +65,22 @@ class RabbitMQClient {
     }
   }
 
-  async #reconnect() {
+  /**
+   * Reconnect to RabbitMQ after connection failure
+   * @returns {Promise<void>}
+   * @private
+   */
+  async _reconnect() {
     if (this._reconnecting) return;
 
     this._reconnecting = true;
     logger.info('Initiating RabbitMQ reconnection sequence');
 
     try {
-      await this.#cleanupExistingConnection();
-      await this.#reconnectWithBackoff();
-      await this.#redeclareExchangesAndBindings();
-      await this.#restoreConsumers();
+      await this._cleanupExistingConnection();
+      await this._reconnectWithBackoff();
+      await this._redeclareExchangesAndBindings();
+      await this._restoreConsumers();
       logger.info('RabbitMQ reconnection completed successfully');
       this._connected = true;
     } catch (error) {
@@ -98,7 +91,12 @@ class RabbitMQClient {
     }
   }
 
-  async #cleanupExistingConnection() {
+  /**
+   * Clean up the existing connection and channels
+   * @returns {Promise<void>}
+   * @private
+   */
+  async _cleanupExistingConnection() {
     try {
       for (const [queueName, channel] of this._channels.entries()) {
         try {
@@ -127,9 +125,15 @@ class RabbitMQClient {
     }
   }
 
-  async #reconnectWithBackoff(attempt = 3) {
-    const MAX_ATTEMPTS = 10;
-    const MAX_DELAY_MS = 30_000;
+  /**
+   * Reconnect with exponential backoff
+   * @param {number} [attempt=1] - Current attempt number
+   * @returns {Promise<void>}
+   * @private
+   */
+  async _reconnectWithBackoff(attempt = 1) {
+    const MAX_ATTEMPTS = this._config.maxReconnectAttempts || 10;
+    const MAX_DELAY_MS = this._config.maxReconnectDelay || 30_000;
 
     try {
       this._client = await amqp.connect(`amqp://${this._config.connectionUrl}`, {
@@ -139,7 +143,7 @@ class RabbitMQClient {
       this._client.on('error', async err => {
         logger.error('RabbitMQ connection error:', err);
         this._connected = false;
-        await this.#reconnect();
+        await this._reconnect();
       });
     } catch (error) {
       if (attempt >= MAX_ATTEMPTS) {
@@ -147,15 +151,23 @@ class RabbitMQClient {
         throw error;
       }
 
-      const delayMs = Math.min(1000 * Math.pow(2, attempt), MAX_DELAY_MS);
+      const delayMs = Math.min(
+        this._config.reconnectDelay * Math.pow(2, attempt - 1),
+        MAX_DELAY_MS
+      );
       logger.info(`Reconnection attempt ${attempt} failed, retrying in ${delayMs}ms`);
 
       await new Promise(resolve => setTimeout(resolve, delayMs));
-      await this.#reconnectWithBackoff(attempt + 1);
+      await this._reconnectWithBackoff(attempt + 1);
     }
   }
 
-  async #redeclareExchangesAndBindings() {
+  /**
+   * Redeclare exchanges and queue bindings after reconnection
+   * @returns {Promise<void>}
+   * @private
+   */
+  async _redeclareExchangesAndBindings() {
     try {
       // Redeclare exchanges
       for (const exchangeName of this._declaredExchanges) {
@@ -179,7 +191,12 @@ class RabbitMQClient {
     }
   }
 
-  async #restoreConsumers() {
+  /**
+   * Restore consumer handlers after reconnection
+   * @returns {Promise<void>}
+   * @private
+   */
+  async _restoreConsumers() {
     for (const [queue, consumerInfo] of this._consumers.entries()) {
       try {
         // Use the stored handler and options
@@ -197,17 +214,22 @@ class RabbitMQClient {
    * @returns {Promise<Array>} - Array of queue objects
    */
   async listQueues() {
-    await this.#ensureConnected();
+    await this._ensureConnected();
 
     try {
-      return await this.#fetchCurrentQueues();
+      return await this._fetchCurrentQueues();
     } catch (error) {
       logger.error('Error listing queues:', error);
       throw error;
     }
   }
 
-  async #fetchCurrentQueues() {
+  /**
+   * Fetch current queues from RabbitMQ management API
+   * @returns {Promise<Array>} - Array of queue objects
+   * @private
+   */
+  async _fetchCurrentQueues() {
     const connectionUrl = this._config.managerHost;
     const [username, password] = connectionUrl.split('@')[0].split(':');
     const host = connectionUrl.split('@')[1].split(':')[0];
@@ -236,7 +258,7 @@ class RabbitMQClient {
    * @returns {Promise<Array>} - Array of exchange objects
    */
   async listExchanges() {
-    await this.#ensureConnected();
+    await this._ensureConnected();
 
     try {
       const connectionUrl = this._config.managerHost;
@@ -269,8 +291,9 @@ class RabbitMQClient {
   /**
    * Ensure client is connected before performing operations
    * @returns {Promise<void>}
+   * @private
    */
-  async #ensureConnected() {
+  async _ensureConnected() {
     if (!this._connected) {
       await this.connect();
     }
@@ -284,7 +307,7 @@ class RabbitMQClient {
    * @returns {Promise<string>} - Consumer tag
    */
   async consume(queue, handler, options = {}) {
-    await this.#ensureConnected();
+    await this._ensureConnected();
 
     const consumerOptions = {
       prefetch: this._config.prefetch,
@@ -293,11 +316,11 @@ class RabbitMQClient {
 
     try {
       await this.assertQueue(queue);
-      const channel = await this.#getChannelForQueue(queue);
+      const channel = await this._getChannelForQueue(queue);
       await channel.prefetch(consumerOptions.prefetch);
 
       const { consumerTag } = await channel.consume(queue, message =>
-        this.#handleIncomingMessage(message, channel, handler, queue)
+        this._handleIncomingMessage(message, channel, handler, queue)
       );
 
       this._consumers.set(queue, {
@@ -314,15 +337,27 @@ class RabbitMQClient {
     }
   }
 
-  async #getChannelForQueue(queue) {
+  /**
+   * Get or create a channel for a specific queue
+   * @param {string} queue - Queue name
+   * @returns {Promise<Object>} - AMQP channel
+   * @private
+   */
+  async _getChannelForQueue(queue) {
     if (this._channels.has(queue)) {
       return this._channels.get(queue);
     }
-    const channel = await this.#createChannelForQueue(queue);
+    const channel = await this._createChannelForQueue(queue);
     return channel;
   }
 
-  async #createChannelForQueue(queue) {
+  /**
+   * Create a new channel for a queue
+   * @param {string} queue - Queue name
+   * @returns {Promise<Object>} - AMQP channel
+   * @private
+   */
+  async _createChannelForQueue(queue) {
     const channel = await this._client.createChannel();
     this._channels.set(queue, channel);
 
@@ -339,14 +374,23 @@ class RabbitMQClient {
     return channel;
   }
 
-  async #handleIncomingMessage(message, channel, handler, queue) {
+  /**
+   * Handle an incoming message from RabbitMQ
+   * @param {Object} message - RabbitMQ message
+   * @param {Object} channel - AMQP channel
+   * @param {Function} handler - Message handler function
+   * @param {string} queue - Queue name
+   * @returns {Promise<void>}
+   * @private
+   */
+  async _handleIncomingMessage(message, channel, handler, queue) {
     if (!message) return; // Consumer cancelled
 
     try {
-      const enhancedMessage = this.#enhanceMessageWithMethods(message, channel);
+      const enhancedMessage = this._enhanceMessageWithMethods(message, channel);
 
       // Extract deduplication ID if present
-      const deduplicationId = this.#extractDeduplicationId(message);
+      const deduplicationId = this._extractDeduplicationId(message);
       if (deduplicationId) {
         logger.debug(`Processing message with deduplication ID: ${deduplicationId}`);
         enhancedMessage.deduplicationId = deduplicationId;
@@ -359,7 +403,13 @@ class RabbitMQClient {
     }
   }
 
-  #extractDeduplicationId(message) {
+  /**
+   * Extract deduplication ID from message properties
+   * @param {Object} message - RabbitMQ message
+   * @returns {string|null} - Deduplication ID or null
+   * @private
+   */
+  _extractDeduplicationId(message) {
     // Try to extract deduplication ID from headers or messageId
     if (message.properties.headers && message.properties.headers['x-deduplication-id']) {
       return message.properties.headers['x-deduplication-id'];
@@ -372,7 +422,14 @@ class RabbitMQClient {
     return null;
   }
 
-  #enhanceMessageWithMethods(message, channel) {
+  /**
+   * Enhance a RabbitMQ message with convenience methods
+   * @param {Object} message - RabbitMQ message
+   * @param {Object} channel - AMQP channel
+   * @returns {Object} - Enhanced message
+   * @private
+   */
+  _enhanceMessageWithMethods(message, channel) {
     return {
       ...message,
       content: message.content,
@@ -400,7 +457,12 @@ class RabbitMQClient {
     };
   }
 
-  async #getPublishChannel() {
+  /**
+   * Get or create a dedicated publish channel
+   * @returns {Promise<Object>} - AMQP channel
+   * @private
+   */
+  async _getPublishChannel() {
     if (!this._publishChannel) {
       this._publishChannel = await this._client.createChannel();
 
@@ -427,7 +489,7 @@ class RabbitMQClient {
    * @returns {Promise<boolean>} - Success indicator
    */
   async publish(exchange, routingKey, content, options = {}) {
-    await this.#ensureConnected();
+    await this._ensureConnected();
 
     try {
       // Ensure exchange exists if not default
@@ -436,8 +498,8 @@ class RabbitMQClient {
         await this.assertExchange(exchange, type);
       }
 
-      const channel = await this.#getPublishChannel();
-      const buffer = this.#prepareContent(content);
+      const channel = await this._getPublishChannel();
+      const buffer = this._prepareContent(content);
 
       // Prepare publish options with deduplication support
       const publishOptions = {
@@ -476,7 +538,13 @@ class RabbitMQClient {
     }
   }
 
-  #prepareContent(content) {
+  /**
+   * Prepare content for publishing
+   * @param {Buffer|string|Object} content - Content to prepare
+   * @returns {Buffer} - Prepared content as Buffer
+   * @private
+   */
+  _prepareContent(content) {
     if (Buffer.isBuffer(content)) {
       return content;
     }
@@ -497,12 +565,12 @@ class RabbitMQClient {
    * @returns {Promise<boolean>} - Success indicator
    */
   async sendToQueue(queue, content, options = {}) {
-    await this.#ensureConnected();
+    await this._ensureConnected();
 
     try {
       await this.assertQueue(queue);
-      const channel = await this.#getPublishChannel();
-      const buffer = this.#prepareContent(content);
+      const channel = await this._getPublishChannel();
+      const buffer = this._prepareContent(content);
 
       // Prepare send options with deduplication support
       const sendOptions = {
@@ -543,10 +611,10 @@ class RabbitMQClient {
    * @returns {Promise<Object>} - Queue details
    */
   async assertQueue(queue, options = {}) {
-    await this.#ensureConnected();
+    await this._ensureConnected();
 
     try {
-      const channel = await this.#getChannelForQueue(queue);
+      const channel = await this._getChannelForQueue(queue);
       const queueOptions = {
         ...this._config.defaultQueueOptions,
         ...options,
@@ -568,10 +636,10 @@ class RabbitMQClient {
    * @returns {Promise<Object>} - Delete result
    */
   async deleteQueue(queue, options = {}) {
-    await this.#ensureConnected();
+    await this._ensureConnected();
 
     try {
-      const channel = await this.#getChannelForQueue(queue);
+      const channel = await this._getChannelForQueue(queue);
 
       // Remove from bound queues
       this._boundQueues.delete(queue);
@@ -602,10 +670,10 @@ class RabbitMQClient {
       );
     }
 
-    await this.#ensureConnected();
+    await this._ensureConnected();
 
     try {
-      const channel = await this.#getPublishChannel();
+      const channel = await this._getPublishChannel();
       const exchangeOptions = {
         ...this._config.defaultExchangeOptions,
         ...options,
@@ -628,10 +696,10 @@ class RabbitMQClient {
    * @returns {Promise<Object>} - Delete result
    */
   async deleteExchange(exchange, options = {}) {
-    await this.#ensureConnected();
+    await this._ensureConnected();
 
     try {
-      const channel = await this.#getPublishChannel();
+      const channel = await this._getPublishChannel();
 
       // Remove from declared exchanges
       this._declaredExchanges.delete(exchange);
@@ -668,7 +736,7 @@ class RabbitMQClient {
    * @returns {Promise<Object>} - Binding result
    */
   async bindQueue(queue, exchange, pattern, args = {}) {
-    await this.#ensureConnected();
+    await this._ensureConnected();
 
     try {
       // Make sure the queue exists
@@ -679,7 +747,7 @@ class RabbitMQClient {
         await this.assertExchange(exchange, this._config.defaultExchangeType);
       }
 
-      const channel = await this.#getChannelForQueue(queue);
+      const channel = await this._getChannelForQueue(queue);
 
       // Track the binding for reconnection purposes
       if (!this._boundQueues.has(queue)) {
@@ -712,10 +780,10 @@ class RabbitMQClient {
    * @returns {Promise<Object>} - Unbinding result
    */
   async unbindQueue(queue, exchange, pattern, args = {}) {
-    await this.#ensureConnected();
+    await this._ensureConnected();
 
     try {
-      const channel = await this.#getChannelForQueue(queue);
+      const channel = await this._getChannelForQueue(queue);
 
       // Remove binding from tracking
       if (this._boundQueues.has(queue)) {
@@ -749,7 +817,7 @@ class RabbitMQClient {
    * @returns {Promise<Array<string>>} - Array of created queue names
    */
   async createShardedQueues(baseName, count, options = {}) {
-    await this.#ensureConnected();
+    await this._ensureConnected();
 
     const queueNames = [];
 
@@ -778,11 +846,11 @@ class RabbitMQClient {
    * @returns {Promise<boolean>} - Success indicator
    */
   async publishToShard(baseName, count, routingKey, content, options = {}) {
-    await this.#ensureConnected();
+    await this._ensureConnected();
 
     try {
       // Simple hash function for consistent routing
-      const hash = this.#calculateHash(routingKey);
+      const hash = this._calculateHash(routingKey);
       const shardIndex = hash % count;
       const queueName = `${baseName}.${shardIndex}`;
 
@@ -797,7 +865,13 @@ class RabbitMQClient {
     }
   }
 
-  #calculateHash(str) {
+  /**
+   * Calculate a hash for consistent routing
+   * @param {string} str - String to hash
+   * @returns {number} - Hash value
+   * @private
+   */
+  _calculateHash(str) {
     let hash = 0;
     for (let i = 0; i < str.length; i++) {
       const char = str.charCodeAt(i);
@@ -818,11 +892,11 @@ class RabbitMQClient {
       return;
     }
 
-    await this.#ensureConnected();
+    await this._ensureConnected();
 
     try {
       const { consumerTag } = this._consumers.get(queue);
-      const channel = await this.#getChannelForQueue(queue);
+      const channel = await this._getChannelForQueue(queue);
       await channel.cancel(consumerTag);
       this._consumers.delete(queue);
       logger.info(`Cancelled consumer for queue ${queue}`);
@@ -852,7 +926,7 @@ class RabbitMQClient {
         }
       }
 
-      await this.#cleanupExistingConnection();
+      await this._cleanupExistingConnection();
       this._connected = false;
       logger.info('RabbitMQ client closed successfully');
     } catch (error) {
@@ -872,10 +946,10 @@ class RabbitMQClient {
       }
 
       // Try to get the publish channel to verify connection is working
-      await this.#getPublishChannel();
+      await this._getPublishChannel();
 
       // Check if we can create and delete a temporary queue
-      const channel = await this.#getPublishChannel();
+      const channel = await this._getPublishChannel();
       const testQueue = `health-check-${Date.now()}`;
       await channel.assertQueue(testQueue, { durable: false, autoDelete: true });
       await channel.deleteQueue(testQueue);
@@ -887,14 +961,3 @@ class RabbitMQClient {
     }
   }
 }
-
-const rabbitMQClient = new RabbitMQClient();
-(async () => {
-  try {
-    await rabbitMQClient.connect();
-  } catch (error) {
-    logger.warn('Initial RabbitMQ connection failed, will retry when needed:', error.message);
-  }
-})();
-
-export default rabbitMQClient;
