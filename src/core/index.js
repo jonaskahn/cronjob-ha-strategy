@@ -25,20 +25,28 @@ const consumer = new Consumer(queueManager, messageTracker, config);
 
 /**
  * Initialize the core components
+ * @param {Object} options - Initialization options
+ * @param {boolean} options.initConsumer - Whether to initialize consumer components
  * @returns {Promise<boolean>} - Success indicator
  */
-export async function initializeCore() {
+export async function initializeCore(options = { initConsumer: true }) {
   try {
     logger.info('Initializing core components...');
-    // Connect to RabbitMQ
+
+    // Connect to RabbitMQ - needed for both publisher and consumer
     await rabbitMQClient.connect();
-    // Initialize coordinator first - handles consumer registration and queue assignments
-    await coordinator.initialize();
-    // Initialize queue manager - handles RabbitMQ interactions
-    await queueManager.initialize();
-    // Initialize consumer - processes messages
-    await consumer.initialize();
-    logger.info('Core components initialized successfully');
+
+    // Only initialize consumer components if requested
+    if (options.initConsumer) {
+      await coordinator.initialize();
+      logger.info('Initializing consumer components...');
+      await queueManager.initialize();
+      await consumer.initialize();
+      logger.info('All core components initialized successfully');
+    } else {
+      logger.info('Publisher-only components initialized successfully');
+    }
+
     return true;
   } catch (error) {
     logger.error('Failed to initialize core components:', error);
@@ -48,14 +56,18 @@ export async function initializeCore() {
 
 /**
  * Shut down the core components gracefully
+ * @param {Object} options - Shutdown options
+ * @param {boolean} options.shutdownConsumer - Whether to shut down consumer components
  * @returns {Promise<boolean>} - Success indicator
  */
-export async function shutdownCore() {
+export async function shutdownCore(options = { shutdownConsumer: true }) {
   try {
     logger.info('Shutting down core components...');
-    // Shutdown in reverse order of initialization
-    await consumer.shutdown();
-    await queueManager.shutdown();
+
+    if (options.shutdownConsumer) {
+      await consumer.shutdown();
+      await queueManager.shutdown();
+    }
     await coordinator.shutdown();
     logger.info('Core components shut down successfully');
     return true;
@@ -74,25 +86,45 @@ export async function shutdownCore() {
  * @param {Object} [queueOptions={}] - Queue options
  * @returns {Promise<boolean>} - Success indicator
  */
-const declareExchangeAndQueue = async (
+export async function declareExchangeAndQueue(
   exchangeName,
   queueName,
   exchangeType = 'direct',
   exchangeOptions = {},
   queueOptions = {}
-) => {
+) {
   try {
     // Assert exchange
     await rabbitMQClient.assertExchange(exchangeName, exchangeType, exchangeOptions);
+
     // Assert queue
     await rabbitMQClient.assertQueue(queueName, queueOptions);
+
     logger.info(`Declared exchange ${exchangeName} and queue ${queueName}`);
     return true;
   } catch (error) {
     logger.error(`Error declaring exchange ${exchangeName} and queue ${queueName}:`, error);
     return false;
   }
-};
+}
+
+/**
+ * Utility function to declare only a queue
+ * @param {string} queueName - Queue name
+ * @param {Object} [queueOptions={}] - Queue options
+ * @returns {Promise<boolean>} - Success indicator
+ */
+export async function declareQueue(queueName, queueOptions = {}) {
+  try {
+    // Assert queue
+    await rabbitMQClient.assertQueue(queueName, queueOptions);
+    logger.info(`Declared queue ${queueName}`);
+    return true;
+  } catch (error) {
+    logger.error(`Error declaring queue ${queueName}:`, error);
+    return false;
+  }
+}
 
 /**
  * Utility function to bind a queue to an exchange
@@ -103,14 +135,18 @@ const declareExchangeAndQueue = async (
  * @param {string} [exchangeType='direct'] - Exchange type
  * @returns {Promise<boolean>} - Success indicator
  */
-const bindQueueToExchange = async (
+export async function bindQueueToExchange(
   queueName,
   exchangeName,
   routingKey,
   priority = 1,
   exchangeType = 'direct'
-) => {
+) {
   try {
+    if (!queueName || !exchangeName) {
+      throw new Error('Queue name and exchange name are required');
+    }
+
     // Store binding information with coordinator
     await coordinator.setQueuePriority(queueName, priority, {
       exchangeName,
@@ -129,16 +165,7 @@ const bindQueueToExchange = async (
     logger.error(`Error binding queue ${queueName} to exchange ${exchangeName}:`, error);
     return false;
   }
-};
+}
 
 // Export components
-export {
-  messageTracker,
-  coordinator,
-  queueManager,
-  consumer,
-  publisher,
-  config,
-  declareExchangeAndQueue,
-  bindQueueToExchange,
-};
+export { messageTracker, coordinator, queueManager, consumer, publisher, config };

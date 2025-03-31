@@ -1,5 +1,6 @@
-import { declareExchangeAndQueue, initializeCore, publisher } from './core/index.js';
+import { coordinator, initializeCore, publisher, shutdownCore } from './core/index.js';
 import getLogger from './utils/logger.js';
+import rabbitMQClient from './client/rabbitMQClient.js';
 
 const logger = getLogger('publish');
 
@@ -11,44 +12,11 @@ const PRIORITY = {
 };
 
 /**
- * Setup RabbitMQ infrastructure for publishing
- */
-async function setupPublisherInfrastructure() {
-  try {
-    // Define our exchanges
-    const exchanges = [
-      { name: 'orders', type: 'direct' },
-      { name: 'payments', type: 'direct' },
-      { name: 'notifications', type: 'direct' },
-      { name: 'shipments', type: 'direct' },
-      { name: 'inventory', type: 'direct' },
-      { name: 'audits', type: 'direct' },
-    ];
-
-    // Create exchanges
-    logger.info('Setting up RabbitMQ exchanges for publishing...');
-    for (const exchange of exchanges) {
-      await declareExchangeAndQueue(
-        exchange.name,
-        exchange.name, // Create a default queue with same name
-        exchange.type
-      );
-      logger.info(`Declared exchange ${exchange.name} with type ${exchange.type}`);
-    }
-
-    logger.info('Publisher infrastructure setup complete');
-  } catch (error) {
-    logger.error('Error setting up publisher infrastructure:', error);
-    throw error;
-  }
-}
-
-/**
  * Publish test messages to various exchanges
  */
 async function publishTestMessages() {
   try {
-    // 1. Publish test order messages
+    // 1. Publish test order messages - UPDATED exchange name to match consumer registration
     for (let i = 0; i < 3; i++) {
       const orderId = `test-order-${Date.now()}-${i}`;
       const order = {
@@ -61,8 +29,8 @@ async function publishTestMessages() {
       };
 
       await publisher.publish({
-        exchangeName: 'orders',
-        routingKey: 'orders.new',
+        exchangeName: 'ex.high-priority-orders', // UPDATED to match consumer registration
+        routingKey: 'rt.orders',
         message: order,
         messageId: orderId,
         currentState: 'NEW',
@@ -74,7 +42,7 @@ async function publishTestMessages() {
       logger.info(`Published test order ${orderId}`);
     }
 
-    // 2. Publish test notification messages
+    // 2. Publish test notification messages - UPDATED to match consumer registration
     for (let i = 0; i < 3; i++) {
       const notificationId = `test-notification-${Date.now()}-${i}`;
       const notification = {
@@ -84,8 +52,8 @@ async function publishTestMessages() {
       };
 
       await publisher.publish({
-        exchangeName: 'notifications',
-        routingKey: 'notifications.new',
+        exchangeName: 'ex.notifications', // This already matches registration
+        routingKey: 'rt.notifications',
         message: notification,
         messageId: notificationId,
         currentState: 'PENDING',
@@ -97,7 +65,7 @@ async function publishTestMessages() {
       logger.info(`Published test notification ${notificationId}`);
     }
 
-    // 3. Publish test payment messages
+    // 3. Publish test payment messages - UPDATED to match consumer registration
     for (let i = 0; i < 3; i++) {
       const paymentId = `test-payment-${Date.now()}-${i}`;
       const payment = {
@@ -116,8 +84,8 @@ async function publishTestMessages() {
       };
 
       await publisher.publish({
-        exchangeName: 'payments',
-        routingKey: 'payments.new',
+        exchangeName: 'ex.payments', // This already matches registration
+        routingKey: 'rt.payments',
         message: payment,
         messageId: paymentId,
         currentState: 'PENDING',
@@ -129,7 +97,7 @@ async function publishTestMessages() {
       logger.info(`Published test payment ${paymentId}`);
     }
 
-    // 4. Publish test shipment messages
+    // 4. Publish test shipment messages - UPDATED to match consumer registration
     for (let i = 0; i < 3; i++) {
       const shipmentId = `test-shipment-${Date.now()}-${i}`;
       const shipment = {
@@ -149,8 +117,8 @@ async function publishTestMessages() {
       };
 
       await publisher.publish({
-        exchangeName: 'shipments',
-        routingKey: 'shipments.new',
+        exchangeName: 'ex.shipments', // This already matches registration
+        routingKey: 'rt.shipments',
         message: shipment,
         messageId: shipmentId,
         currentState: 'CREATED',
@@ -162,7 +130,7 @@ async function publishTestMessages() {
       logger.info(`Published test shipment ${shipmentId}`);
     }
 
-    // 5. Publish test inventory messages
+    // 5. Publish test inventory messages - UPDATED to match consumer registration
     for (let i = 0; i < 3; i++) {
       const inventoryId = `test-inventory-${Date.now()}-${i}`;
       const inventory = {
@@ -174,8 +142,8 @@ async function publishTestMessages() {
       };
 
       await publisher.publish({
-        exchangeName: 'inventory',
-        routingKey: 'inventory.allocate',
+        exchangeName: 'ex.inventory', // This already matches registration
+        routingKey: 'rt.inventory',
         message: inventory,
         messageId: inventoryId,
         currentState: 'AVAILABLE',
@@ -187,7 +155,7 @@ async function publishTestMessages() {
       logger.info(`Published test inventory update ${inventoryId}`);
     }
 
-    // 6. Publish test audit messages
+    // 6. Publish test audit messages - UPDATED to match consumer registration
     for (let i = 0; i < 3; i++) {
       const auditId = `test-audit-${Date.now()}-${i}`;
       const audit = {
@@ -200,8 +168,8 @@ async function publishTestMessages() {
       };
 
       await publisher.publish({
-        exchangeName: 'audits',
-        routingKey: 'audits.new',
+        exchangeName: 'ex.audits', // This already matches registration
+        routingKey: 'rt.audits',
         message: audit,
         messageId: auditId,
         currentState: 'PENDING',
@@ -220,16 +188,97 @@ async function publishTestMessages() {
 }
 
 /**
+ * Set up the messaging infrastructure (exchanges, queues, bindings)
+ * This ensures that all required exchanges and queues exist before publishing
+ * @returns {Promise<boolean>} - Success indicator
+ */
+export async function setupInfrastructure() {
+  try {
+    logger.info('Setting up messaging infrastructure...');
+
+    // First, declare exchanges
+    const exchanges = [
+      { name: 'ex.high-priority-orders', type: 'direct' },
+      { name: 'ex.notifications', type: 'direct' },
+      { name: 'ex.payments', type: 'direct' },
+      { name: 'ex.shipments', type: 'direct' },
+      { name: 'ex.inventory', type: 'direct' },
+      { name: 'ex.audits', type: 'direct' },
+    ];
+
+    for (const exchange of exchanges) {
+      await rabbitMQClient.assertExchange(exchange.name, exchange.type);
+      logger.info(`Declared exchange: ${exchange.name} (${exchange.type})`);
+    }
+
+    // Next, declare queues
+    const queues = [
+      { name: 'q.high-priority-orders', priority: 3 },
+      { name: 'q.notifications', priority: 1 },
+      { name: 'q.payments', priority: 3 },
+      { name: 'q.shipments', priority: 3 },
+      { name: 'q.inventory', priority: 2 },
+      { name: 'q.audit', priority: 1 },
+    ];
+
+    for (const queue of queues) {
+      await rabbitMQClient.assertQueue(queue.name);
+      logger.info(`Declared queue: ${queue.name} (priority: ${queue.priority})`);
+    }
+
+    // Finally, bind queues to exchanges
+    const bindings = [
+      {
+        queue: 'q.high-priority-orders',
+        exchange: 'ex.high-priority-orders',
+        routingKey: 'rt.orders',
+      },
+      { queue: 'q.notifications', exchange: 'ex.notifications', routingKey: 'rt.notifications' },
+      { queue: 'q.payments', exchange: 'ex.payments', routingKey: 'rt.payments' },
+      { queue: 'q.shipments', exchange: 'ex.shipments', routingKey: 'rt.shipments' },
+      { queue: 'q.inventory', exchange: 'ex.inventory', routingKey: 'rt.inventory' },
+      { queue: 'q.audit', exchange: 'ex.audits', routingKey: 'rt.audits' },
+    ];
+
+    for (const binding of bindings) {
+      await rabbitMQClient.bindQueue(binding.queue, binding.exchange, binding.routingKey);
+
+      // Also register the binding with the coordinator for priority-based allocation
+      await coordinator.setQueuePriority(
+        binding.queue,
+        queues.find(q => q.name === binding.queue)?.priority || 1,
+        {
+          exchangeName: binding.exchange,
+          routingKey: binding.routingKey,
+          exchangeType: exchanges.find(e => e.name === binding.exchange)?.type || 'direct',
+        }
+      );
+
+      logger.info(
+        `Bound queue ${binding.queue} to exchange ${binding.exchange} with routing key ${binding.routingKey}`
+      );
+    }
+
+    logger.info('Messaging infrastructure setup complete');
+    return true;
+  } catch (error) {
+    logger.error('Error setting up messaging infrastructure:', error);
+    return false;
+  }
+}
+
+/**
  * Main publisher function
  */
 async function main() {
   try {
-    // Initialize core components
-    await initializeCore();
-    logger.info('Core initialized for publisher');
+    // Initialize only the components needed for publishing
+    await initializeCore({ initConsumer: false });
+    logger.info('Core initialized for publisher (publisher-only mode)');
 
-    // Setup publisher infrastructure
-    await setupPublisherInfrastructure();
+    // Set up all exchanges, queues, and bindings
+    await setupInfrastructure();
+    logger.info('Messaging infrastructure setup complete');
 
     // Wait a moment to ensure infrastructure is ready
     await new Promise(resolve => setTimeout(resolve, 3000));
@@ -239,6 +288,9 @@ async function main() {
 
     // Exit after publishing
     logger.info('Publisher completed, exiting...');
+
+    // Clean shutdown using publisher-only mode
+    await shutdownCore({ shutdownConsumer: false });
     process.exit(0);
   } catch (error) {
     logger.error('Fatal error in publisher:', error);

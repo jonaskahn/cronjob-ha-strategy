@@ -73,6 +73,10 @@ export default class QueueManager {
    * @param {string} bindingInfo.routingKey - Routing key
    * @param {string} [bindingInfo.exchangeType] - Exchange type (direct, topic, fanout)
    * @param {number} [priority=1] - Queue priority (1=low, 2=medium, 3=high)
+   * @param {Object} [ackOptions] - Message acknowledgement options
+   * @param {boolean} [ackOptions.autoAck=true] - Automatically acknowledge on success
+   * @param {boolean} [ackOptions.autoReject=true] - Automatically reject on error
+   * @param {boolean} [ackOptions.requeue=false] - Whether to requeue rejected messages
    */
   registerQueueStateHandler(
     queueName,
@@ -81,10 +85,20 @@ export default class QueueManager {
     nextState,
     handler,
     bindingInfo = null,
-    priority = 1
+    priority = 1,
+    ackOptions = {
+      autoAck: true,
+      autoReject: true,
+      requeue: false,
+    }
   ) {
     const stateKey = `${queueName}:${this._getStateTransitionKey(currentState, processingState, nextState)}`;
-    this._stateHandlers.set(stateKey, handler);
+
+    // Store the handler and acknowledgement options
+    this._stateHandlers.set(stateKey, {
+      handler,
+      ackOptions,
+    });
 
     // Register binding information with coordinator if provided
     if (bindingInfo) {
@@ -99,7 +113,7 @@ export default class QueueManager {
     }
 
     logger.info(
-      `Registered handler for queue ${queueName} state transition: ${currentState} -> ${processingState} -> ${nextState}`
+      `Registered handler for queue ${queueName} state transition: ${currentState} -> ${processingState} -> ${nextState} (autoAck: ${ackOptions.autoAck}, autoReject: ${ackOptions.autoReject}, requeue: ${ackOptions.requeue})`
     );
   }
 
@@ -438,7 +452,8 @@ export default class QueueManager {
       const stateKey = `${queueName}:${this._getStateTransitionKey(currentState, processingState, nextState)}`;
 
       if (this._stateHandlers.has(stateKey)) {
-        const handler = this._stateHandlers.get(stateKey);
+        const { handler, ackOptions = { autoAck: true, autoReject: true, requeue: false } } =
+          this._stateHandlers.get(stateKey);
 
         // Parse message content
         let content;
@@ -449,16 +464,40 @@ export default class QueueManager {
         }
 
         // Process message with handler
-        await handler(content, {
+        const success = await handler(content, {
           messageId,
           queueName,
           currentState,
           processingState,
           nextState,
           headers,
+          message: {
+            ack: () => message.ack(),
+            nack: (requeue = false) => message.nack(requeue),
+            reject: (requeue = false) => message.reject(requeue),
+          },
         });
-
-        // Acknowledgement is handled by the handler
+        if (success) {
+          if (ackOptions.autoAck) {
+            await message.ack();
+            logger.debug(`Message ${messageId} auto-acknowledged after successful processing`);
+          } else {
+            logger.debug(
+              `Message ${messageId} processed successfully, but autoAck disabled - manual acknowledgement required`
+            );
+          }
+        } else if (success === false) {
+          if (ackOptions.autoReject) {
+            await message.reject(ackOptions.requeue);
+            logger.debug(
+              `Message ${messageId} auto-rejected (requeue: ${ackOptions.requeue}) after handler returned false`
+            );
+          } else {
+            logger.debug(
+              `Message ${messageId} processing failed, but autoReject disabled - manual rejection required`
+            );
+          }
+        }
       } else {
         logger.warn(
           `No handler for queue ${queueName} state transition: ${currentState} -> ${processingState} -> ${nextState}`
@@ -468,13 +507,32 @@ export default class QueueManager {
       }
     } catch (error) {
       logger.error(`Error processing message ${messageId} from queue ${queueName}:`, error);
+
+      // Find ackOptions to determine error behavior
+      const stateKey = `${queueName}:${this._getStateTransitionKey(currentState, processingState, nextState)}`;
+      const { ackOptions = { autoAck: true, autoReject: true, requeue: false } } =
+        this._stateHandlers.get(stateKey) || {};
+
       try {
-        await this._messageTracker.deleteProcessingState(messageId, currentState);
+        // Clean up processing state if an error occurs
+        if (this._messageTracker) {
+          await this._messageTracker.deleteProcessingState(messageId, currentState);
+        }
       } catch (redisError) {
         logger.warn(`Error cleaning up processing state: ${redisError.message}`);
       }
 
-      await message.reject(false); // Don't requeue
+      // Auto-reject on error if enabled
+      if (ackOptions.autoReject) {
+        await message.reject(ackOptions.requeue);
+        logger.debug(
+          `Message ${messageId} auto-rejected (requeue: ${ackOptions.requeue}) after processing error`
+        );
+      } else {
+        logger.debug(
+          `Message ${messageId} processing threw error, but autoReject disabled - manual handling required`
+        );
+      }
     }
   }
 

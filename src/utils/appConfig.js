@@ -24,12 +24,12 @@ export class AppConfig {
         ['localhost:6379', 'localhost:6380', 'localhost:6381']
       ),
       natMap: {
-        '172.19.0.2:6379': { host: 'localhost', port: 6379 },
-        '172.19.0.3:6379': { host: 'localhost', port: 6380 },
-        '172.19.0.4:6379': { host: 'localhost', port: 6381 },
-        '172.19.0.5:6379': { host: 'localhost', port: 6382 },
-        '172.19.0.6:6379': { host: 'localhost', port: 6383 },
-        '172.19.0.7:6379': { host: 'localhost', port: 6384 },
+        '172.20.0.2:6379': { host: 'localhost', port: 6379 },
+        '172.20.0.3:6379': { host: 'localhost', port: 6380 },
+        '172.20.0.4:6379': { host: 'localhost', port: 6381 },
+        '172.20.0.5:6379': { host: 'localhost', port: 6382 },
+        '172.20.0.6:6379': { host: 'localhost', port: 6383 },
+        '172.20.0.7:6379': { host: 'localhost', port: 6384 },
       },
     };
 
@@ -53,10 +53,12 @@ export class AppConfig {
       defaultExchangeOptions: {
         durable: true,
         autoDelete: false,
+        exclusive: false,
       },
       defaultQueueOptions: {
         durable: true,
         autoDelete: false,
+        exclusive: false,
       },
     };
 

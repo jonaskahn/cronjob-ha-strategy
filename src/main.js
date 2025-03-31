@@ -1,11 +1,5 @@
 // main app
-import {
-  bindQueueToExchange,
-  consumer,
-  declareExchangeAndQueue,
-  initializeCore,
-  shutdownCore,
-} from './core/index.js';
+import { consumer, initializeCore, shutdownCore } from './core/index.js';
 import getLogger from './utils/logger.js';
 
 // Constants for priority levels
@@ -295,12 +289,6 @@ const sendPaymentFailureNotification = async (orderId, reason) => {
   return { success: true };
 };
 
-const checkInventory = async productId => {
-  logger.info(`FAKE: Checking inventory for product ${productId}`);
-  // Return random inventory between 0 and 20
-  return Math.floor(Math.random() * 20);
-};
-
 const processPayment = async paymentDetails => {
   logger.info(
     `FAKE: Processing payment for order ${paymentDetails.orderId} of ${paymentDetails.amount}`
@@ -326,16 +314,6 @@ const recordPaymentDetails = async (orderId, transactionId) => {
     `FAKE: Recording payment details for order ${orderId}, transaction: ${transactionId}`
   );
   return { success: true };
-};
-
-const calculateOrderTotal = order => {
-  // Fake calculation
-  const total = order.items
-    ? order.items.reduce((sum, item) => sum + (item.price || 10) * item.quantity, 0)
-    : Math.floor(Math.random() * 200);
-
-  logger.info(`FAKE: Calculated order total: ${total}`);
-  return total;
 };
 
 const sendNotification = async (recipient, message, channel) => {
@@ -384,97 +362,6 @@ const logAuditEvent = async (entityType, entityId, action, userId) => {
   return { success: true, auditId: `AUDIT-${Date.now()}` };
 };
 
-/**
- * Setup exchanges and queues for the application
- */
-async function setupInfrastructure() {
-  try {
-    // Define our exchanges
-    const exchanges = [
-      { name: 'orders', type: 'direct' },
-      { name: 'payments', type: 'direct' },
-      { name: 'notifications', type: 'direct' },
-      { name: 'shipments', type: 'direct' },
-      { name: 'inventory', type: 'direct' },
-      { name: 'audits', type: 'direct' },
-    ];
-
-    // Define our queues with bindings
-    const queueBindings = [
-      {
-        queueName: 'high-priority-orders',
-        exchangeName: 'orders',
-        routingKey: 'orders.new',
-        priority: PRIORITY.HIGH,
-      },
-      {
-        queueName: 'payments',
-        exchangeName: 'payments',
-        routingKey: 'payments.new',
-        priority: PRIORITY.HIGH,
-      },
-      {
-        queueName: 'shipments',
-        exchangeName: 'shipments',
-        routingKey: 'shipments.new',
-        priority: PRIORITY.HIGH,
-      },
-      {
-        queueName: 'inventory',
-        exchangeName: 'inventory',
-        routingKey: 'inventory.allocate',
-        priority: PRIORITY.MEDIUM,
-      },
-      {
-        queueName: 'notifications',
-        exchangeName: 'notifications',
-        routingKey: 'notifications.new',
-        priority: PRIORITY.LOW,
-      },
-      {
-        queueName: 'audit-logs',
-        exchangeName: 'audits',
-        routingKey: 'audits.new',
-        priority: PRIORITY.LOW,
-      },
-    ];
-
-    // Create exchanges
-    logger.info('Setting up RabbitMQ exchanges...');
-    for (const exchange of exchanges) {
-      await declareExchangeAndQueue(
-        exchange.name,
-        exchange.name, // Create a default queue with same name
-        exchange.type
-      );
-      logger.info(`Declared exchange ${exchange.name} with type ${exchange.type}`);
-    }
-
-    // Create queue bindings
-    logger.info('Setting up RabbitMQ queue bindings...');
-    for (const binding of queueBindings) {
-      // First declare the queue separately to ensure it exists
-      await declareExchangeAndQueue(null, binding.queueName);
-
-      // Then create the binding
-      await bindQueueToExchange(
-        binding.queueName,
-        binding.exchangeName,
-        binding.routingKey,
-        binding.priority
-      );
-      logger.info(
-        `Created binding: ${binding.queueName} -> ${binding.exchangeName} (${binding.routingKey}) with priority ${binding.priority}`
-      );
-    }
-
-    logger.info('RabbitMQ infrastructure setup complete');
-  } catch (error) {
-    logger.error('Error setting up RabbitMQ infrastructure:', error);
-    throw error; // Rethrow to handle in main initialize function
-  }
-}
-
 // Initialize the system
 async function initialize() {
   try {
@@ -485,27 +372,21 @@ async function initialize() {
     await initializeCore();
     logger.info('Core system initialized successfully');
 
-    // Setup RabbitMQ infrastructure
-    await setupInfrastructure();
-    logger.info('Infrastructure setup complete');
-
     // 1. Register handler for orders queue
-    consumer.registerHandler({
-      queueName: 'high-priority-orders',
+    consumer.register({
+      queueName: 'q.high-priority-orders',
       currentState: 'NEW',
       processingState: 'VALIDATING',
       nextState: 'VALIDATED',
-      // Add binding information
       bindingInfo: {
-        exchangeName: 'orders',
-        routingKey: 'orders.new',
+        exchangeName: 'ex.high-priority-orders',
+        routingKey: 'rt.orders',
         exchangeType: 'direct',
       },
       priority: PRIORITY.HIGH,
       handler: async (order, metadata) => {
         logger.info(`Processing order validation for ${metadata.messageId}`);
         await sleep(getRandomInt(2500, 10_000));
-
         logger.info(`Order ${metadata.messageId} validated successfully`);
       },
 
@@ -583,15 +464,14 @@ async function initialize() {
     });
 
     // 2. Register handler for notifications queue
-    consumer.registerHandler({
-      queueName: 'notifications',
+    consumer.register({
+      queueName: 'q.notifications',
       currentState: 'PENDING',
       processingState: 'SENDING',
       nextState: 'SENT',
-      // Add binding information
       bindingInfo: {
-        exchangeName: 'notifications',
-        routingKey: 'notifications.new',
+        exchangeName: 'ex.notifications',
+        routingKey: 'rt.notifications',
         exchangeType: 'direct',
       },
       priority: PRIORITY.LOW,
@@ -672,15 +552,15 @@ async function initialize() {
     });
 
     // 3. Register handler for payments queue
-    consumer.registerHandler({
-      queueName: 'payments',
+    consumer.register({
+      queueName: 'q.payments',
       currentState: 'PENDING',
       processingState: 'PROCESSING',
       nextState: 'AUTHORIZED',
       // Add binding information
       bindingInfo: {
-        exchangeName: 'payments',
-        routingKey: 'payments.new',
+        exchangeName: 'ex.payments',
+        routingKey: 'rt.payments',
         exchangeType: 'direct',
       },
       priority: PRIORITY.HIGH,
@@ -764,15 +644,15 @@ async function initialize() {
     });
 
     // 4. Register handler for shipments queue
-    consumer.registerHandler({
-      queueName: 'shipments',
+    consumer.register({
+      queueName: 'q.shipments',
       currentState: 'CREATED',
       processingState: 'PICKING',
       nextState: 'PICKED',
       // Add binding information
       bindingInfo: {
-        exchangeName: 'shipments',
-        routingKey: 'shipments.new',
+        exchangeName: 'ex.shipments',
+        routingKey: 'rt.shipments',
         exchangeType: 'direct',
       },
       priority: PRIORITY.HIGH,
@@ -848,15 +728,15 @@ async function initialize() {
     });
 
     // 5. Register handler for inventory queue
-    consumer.registerHandler({
-      queueName: 'inventory',
+    consumer.register({
+      queueName: 'q.inventory',
       currentState: 'AVAILABLE',
       processingState: 'ALLOCATING',
       nextState: 'ALLOCATED',
       // Add binding information
       bindingInfo: {
-        exchangeName: 'inventory',
-        routingKey: 'inventory.allocate',
+        exchangeName: 'ex.inventory',
+        routingKey: 'rt.inventory',
         exchangeType: 'direct',
       },
       priority: PRIORITY.MEDIUM,
@@ -931,15 +811,15 @@ async function initialize() {
     });
 
     // 6. Register handler for audit queue
-    consumer.registerHandler({
-      queueName: 'audit-logs',
+    consumer.register({
+      queueName: 'q.audit',
       currentState: 'PENDING',
       processingState: 'PROCESSING',
       nextState: 'COMPLETED',
       // Add binding information
       bindingInfo: {
-        exchangeName: 'audits',
-        routingKey: 'audits.new',
+        exchangeName: 'ex.audits',
+        routingKey: 'rt.audits',
         exchangeType: 'direct',
       },
       priority: PRIORITY.LOW,

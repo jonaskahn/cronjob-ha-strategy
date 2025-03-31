@@ -66,9 +66,13 @@ export default class Consumer {
    * @param {string} options.bindingInfo.routingKey - Routing key
    * @param {string} [options.bindingInfo.exchangeType] - Exchange type (direct, topic, fanout)
    * @param {number} [options.priority=1] - Queue priority (1=low, 2=medium, 3=high)
+   * @param {Object} [options.ackOptions] - Message acknowledgement options
+   * @param {boolean} [options.ackOptions.autoAck=true] - Automatically acknowledge on success
+   * @param {boolean} [options.ackOptions.autoReject=true] - Automatically reject on error
+   * @param {boolean} [options.ackOptions.requeue=false] - Whether to requeue rejected messages
    * @returns {boolean} - Success indicator
    */
-  registerHandler(options) {
+  register(options) {
     const {
       queueName,
       currentState,
@@ -80,6 +84,11 @@ export default class Consumer {
       onErrorProcess,
       bindingInfo,
       priority = 1,
+      ackOptions = {
+        autoAck: true,
+        autoReject: true,
+        requeue: false,
+      },
     } = options;
 
     if (!queueName || !currentState || !processingState || !nextState) {
@@ -106,7 +115,7 @@ export default class Consumer {
       onErrorProcess: onErrorProcess || (async () => true),
     });
 
-    // Register state handler
+    // Register state handler with acknowledgement options
     const stateKey = `${queueName}:${this._getStateTransitionKey(currentState, processingState, nextState)}`;
     this._stateHandlers.set(stateKey, {
       handler,
@@ -114,20 +123,21 @@ export default class Consumer {
       currentState,
       processingState,
       nextState,
+      ackOptions, // Store acknowledgement options
     });
 
-    // Register with queue manager - including binding information
     this._registerHandlerWithQueueManager(
       queueName,
       currentState,
       processingState,
       nextState,
       bindingInfo,
-      priority
+      priority,
+      ackOptions
     );
 
     logger.info(
-      `Registered handler for queue ${queueName} state transition: ${currentState} -> ${processingState} -> ${nextState}${bindingInfo ? ' with binding information' : ''}`
+      `Registered handler for queue ${queueName} state transition: ${currentState} -> ${processingState} -> ${nextState}${bindingInfo ? ' with binding information' : ''} (autoAck: ${ackOptions.autoAck}, autoReject: ${ackOptions.autoReject})`
     );
     return true;
   }
@@ -365,6 +375,7 @@ export default class Consumer {
    * @param {string} nextState - Next state
    * @param {Object} [bindingInfo] - Optional queue binding information
    * @param {number} [priority=1] - Queue priority
+   * @param {Object} [ackOptions] - Message acknowledgement options
    * @private
    */
   _registerHandlerWithQueueManager(
@@ -373,7 +384,8 @@ export default class Consumer {
     processingState,
     nextState,
     bindingInfo = null,
-    priority = 1
+    priority = 1,
+    ackOptions = { autoAck: true, autoReject: true, requeue: false }
   ) {
     if (this._queueManager) {
       // Get the state key
@@ -404,7 +416,8 @@ export default class Consumer {
         nextState,
         wrappedHandler,
         bindingInfo,
-        priority
+        priority,
+        ackOptions
       );
 
       logger.debug(
