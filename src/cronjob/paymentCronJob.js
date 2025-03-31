@@ -1,7 +1,7 @@
 // PaymentProcessingJob.js
 import AbstractCronJob from './AbstractCronJob.js';
 import getLogger from '../utils/logger.js';
-import { QueuePriorityConstant } from '../utils/index.js';
+import { QueuePriorityConstant } from '../utils/main.js';
 
 const logger = getLogger('jobs/PaymentProcessingJob');
 

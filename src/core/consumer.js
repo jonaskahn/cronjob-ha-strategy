@@ -1,4 +1,3 @@
-// consumer.js
 import getLogger from '../utils/logger.js';
 
 const logger = getLogger('core/Consumer');
@@ -20,18 +19,19 @@ export default class Consumer {
     this._messageTracker = messageTracker;
     this._options = {
       maxConcurrent: config.consumer.maxConcurrent,
-      verifyFinalState: config.consumer.verifyFinalState,
       retryDelay: config.consumer.retryDelay,
       maxRetries: config.consumer.maxRetries,
       monitorInterval: config.consumer.monitorInterval,
     };
 
     this._stateHandlers = new Map();
+    this._queueCallbacks = new Map(); // Store callbacks by queue
     this._activeProcessing = new Map();
     this._processingCount = 0;
     this._successCount = 0;
     this._errorCount = 0;
     this._monitorInterval = null;
+    this._queueStats = new Map(); // Track stats by queue
 
     logger.info('Consumer initialized with options:', this._options);
   }
@@ -42,16 +42,7 @@ export default class Consumer {
    */
   async initialize() {
     try {
-      if (this._options.verifyFinalState) {
-        await this._stateStorage.initializeTable();
-      }
-
-      // Register handlers with queue manager
-      this._registerHandlersWithQueueManager();
-
-      // Start monitoring
       this._startMonitoring();
-
       logger.info('Consumer initialized successfully');
     } catch (error) {
       logger.error('Error initializing consumer:', error);
@@ -60,69 +51,97 @@ export default class Consumer {
   }
 
   /**
-   * Register a handler for a specific state transition
-   * @param {string} currentState - Current state
-   * @param {string} processingState - Processing state
-   * @param {string} nextState - Next state
-   * @param {Function} handler - Handler function
+   * Register state handler and callbacks in a single method
+   * @param {Object} options - Registration options
+   * @param {string} options.queueName - Queue name
+   * @param {string} options.currentState - Current state
+   * @param {string} options.processingState - Processing state
+   * @param {string} options.nextState - Next state
+   * @param {Function} options.handler - Message processing handler function
+   * @param {Function} [options.isCompletedProcess] - Function to check if process already completed
+   * @param {Function} [options.onCompletedProcess] - Function to call on successful processing
+   * @param {Function} [options.onErrorProcess] - Function to call on processing error
+   * @param {Object} [options.bindingInfo] - Queue binding information
+   * @param {string} options.bindingInfo.exchangeName - Exchange name
+   * @param {string} options.bindingInfo.routingKey - Routing key
+   * @param {string} [options.bindingInfo.exchangeType] - Exchange type (direct, topic, fanout)
+   * @param {number} [options.priority=1] - Queue priority (1=low, 2=medium, 3=high)
    * @returns {boolean} - Success indicator
    */
-  registerStateHandler(currentState, processingState, nextState, handler) {
-    if (!currentState || !processingState || !nextState) {
-      throw new Error('State information (currentState, processingState, nextState) is required');
+  registerHandler(options) {
+    const {
+      queueName,
+      currentState,
+      processingState,
+      nextState,
+      handler,
+      isCompletedProcess,
+      onCompletedProcess,
+      onErrorProcess,
+      bindingInfo,
+      priority = 1,
+    } = options;
+
+    if (!queueName || !currentState || !processingState || !nextState) {
+      throw new Error('Queue name and state information are required');
     }
 
     if (typeof handler !== 'function') {
       throw new Error('Handler must be a function');
     }
 
-    const stateKey = this._getStateTransitionKey(currentState, processingState, nextState);
-    this._stateHandlers.set(stateKey, handler);
+    // Initialize queue stats if not exists
+    if (!this._queueStats.has(queueName)) {
+      this._queueStats.set(queueName, {
+        processCount: 0,
+        successCount: 0,
+        errorCount: 0,
+      });
+    }
 
-    // Register with queue manager if already initialized
-    this._registerHandlerWithQueueManager(currentState, processingState, nextState);
+    // Register callbacks for this queue
+    this._queueCallbacks.set(queueName, {
+      isCompletedProcess: isCompletedProcess || (async () => null),
+      onCompletedProcess: onCompletedProcess || (async () => true),
+      onErrorProcess: onErrorProcess || (async () => true),
+    });
+
+    // Register state handler
+    const stateKey = `${queueName}:${this._getStateTransitionKey(currentState, processingState, nextState)}`;
+    this._stateHandlers.set(stateKey, {
+      handler,
+      queueName,
+      currentState,
+      processingState,
+      nextState,
+    });
+
+    // Register with queue manager - including binding information
+    this._registerHandlerWithQueueManager(
+      queueName,
+      currentState,
+      processingState,
+      nextState,
+      bindingInfo,
+      priority
+    );
 
     logger.info(
-      `Registered handler for state transition: ${currentState} -> ${processingState} -> ${nextState}`
+      `Registered handler for queue ${queueName} state transition: ${currentState} -> ${processingState} -> ${nextState}${bindingInfo ? ' with binding information' : ''}`
     );
     return true;
   }
 
   /**
-   * Unregister a state handler
-   * @param {string} currentState - Current state
-   * @param {string} processingState - Processing state
-   * @param {string} nextState - Next state
-   * @returns {boolean} - Success indicator
-   */
-  unregisterStateHandler(currentState, processingState, nextState) {
-    const stateKey = this._getStateTransitionKey(currentState, processingState, nextState);
-    const result = this._stateHandlers.delete(stateKey);
-
-    if (result) {
-      logger.info(
-        `Unregistered handler for state transition: ${currentState} -> ${processingState} -> ${nextState}`
-      );
-    } else {
-      logger.warn(
-        `No handler found for state transition: ${currentState} -> ${processingState} -> ${nextState}`
-      );
-    }
-
-    return result;
-  }
-
-  /**
    * Process a message with the appropriate state handler
-   * This is the core message processing method that implements the state transition flow
    * @param {Object} message - Message content
    * @param {Object} metadata - Message metadata
    * @returns {Promise<boolean>} - Success indicator
    */
   async processMessage(message, metadata) {
-    const { messageId, currentState, processingState, nextState } = metadata;
+    const { messageId, queueName, currentState, processingState, nextState } = metadata;
 
-    if (!messageId || !currentState || !processingState || !nextState) {
+    if (!messageId || !queueName || !currentState || !processingState || !nextState) {
       logger.error('Missing required metadata for message processing');
       return false;
     }
@@ -135,13 +154,30 @@ export default class Consumer {
       await new Promise(resolve => setTimeout(resolve, this._options.retryDelay));
     }
 
-    const stateKey = this._getStateTransitionKey(currentState, processingState, nextState);
+    // Get queue-specific state key
+    const stateKey = `${queueName}:${this._getStateTransitionKey(currentState, processingState, nextState)}`;
 
     // Check if we have a handler for this state transition
     if (!this._stateHandlers.has(stateKey)) {
       logger.warn(`No handler found for state transition: ${stateKey}`);
       return false;
     }
+
+    // Get queue-specific callbacks or use defaults
+    const callbacks = this._queueCallbacks.get(queueName) || {
+      isCompletedProcess: async () => null,
+      onCompletedProcess: async () => true,
+      onErrorProcess: async () => true,
+    };
+
+    // Get queue stats
+    const queueStats = this._queueStats.get(queueName) || {
+      processCount: 0,
+      successCount: 0,
+      errorCount: 0,
+    };
+    queueStats.processCount++;
+    this._queueStats.set(queueName, queueStats);
 
     // Check if message is already being processed in Redis
     const isProcessing = await this._messageTracker.isProcessing(messageId, currentState);
@@ -152,19 +188,18 @@ export default class Consumer {
       return false;
     }
 
-    // Check if already completed in database (if verification enabled)
-    if (this._options.verifyFinalState) {
-      const finalState = await this._stateStorage.getFinalState(messageId, currentState);
-      if (finalState) {
-        logger.info(
-          `Message ${messageId} already completed state transition to ${finalState.nextState}, skipping`
-        );
-        return true;
-      }
+    // Check if already completed using the queue-specific callback
+    const finalState = await callbacks.isCompletedProcess(messageId, currentState);
+    if (finalState) {
+      logger.info(
+        `Message ${messageId} from queue ${queueName} already completed state transition, skipping`
+      );
+      return true;
     }
 
     // Mark as processing in Redis
     await this._messageTracker.createProcessingState(messageId, currentState, {
+      queueName,
       processingState,
       nextState,
       startedAt: Date.now(),
@@ -176,6 +211,7 @@ export default class Consumer {
     const processingKey = `${messageId}:${currentState}`;
     this._activeProcessing.set(processingKey, {
       messageId,
+      queueName,
       currentState,
       processingState,
       nextState,
@@ -184,43 +220,53 @@ export default class Consumer {
 
     try {
       // Get the handler
-      const handler = this._stateHandlers.get(stateKey);
+      const handlerInfo = this._stateHandlers.get(stateKey);
+      const handler = handlerInfo.handler;
 
       // Execute handler
       logger.debug(
-        `Processing message ${messageId} with state transition: ${currentState} -> ${processingState} -> ${nextState}`
+        `Processing message ${messageId} from queue ${queueName} with state transition: ${currentState} -> ${processingState} -> ${nextState}`
       );
       await handler(message, metadata);
 
-      // Store final state if requested
-      if (this._options.verifyFinalState) {
-        await this._stateStorage.storeFinalState(messageId, currentState, nextState, {
-          completedAt: new Date(),
-          metadata: JSON.stringify({
-            processingTime: Date.now() - processingStart,
-            ...metadata,
-          }),
-        });
-      }
+      // Call queue-specific success callback
+      await callbacks.onCompletedProcess(messageId, currentState, nextState, {
+        completedAt: new Date(),
+        processingTime: Date.now() - processingStart,
+        ...metadata,
+      });
 
       // Delete processing state in Redis
       await this._messageTracker.deleteProcessingState(messageId, currentState);
 
-      // Update success counter
+      // Update success counters
       this._successCount++;
+      queueStats.successCount++;
+      this._queueStats.set(queueName, queueStats);
 
       logger.debug(
-        `Successfully processed message ${messageId} with state transition: ${currentState} -> ${processingState} -> ${nextState}`
+        `Successfully processed message ${messageId} from queue ${queueName} with state transition: ${currentState} -> ${processingState} -> ${nextState}`
       );
       return true;
     } catch (error) {
-      // Update error counter
+      // Update error counters
       this._errorCount++;
+      queueStats.errorCount++;
+      this._queueStats.set(queueName, queueStats);
+
+      // Call queue-specific error callback
+      await callbacks.onErrorProcess(messageId, currentState, error, {
+        error: error.message,
+        stack: error.stack,
+        failedAt: new Date(),
+        processingTime: Date.now() - processingStart,
+        ...metadata,
+      });
 
       // Delete processing state on error
       await this._messageTracker.deleteProcessingState(messageId, currentState);
 
-      logger.error(`Error processing message ${messageId}:`, error);
+      logger.error(`Error processing message ${messageId} from queue ${queueName}:`, error);
       return false;
     } finally {
       // Clean up tracking
@@ -230,224 +276,37 @@ export default class Consumer {
   }
 
   /**
-   * Batch process multiple messages
-   * @param {Array<Object>} messages - Array of message objects with content and metadata
-   * @returns {Promise<Object>} - Map of messageId to success status
-   */
-  async batchProcessMessages(messages) {
-    if (!messages || !messages.length) return {};
-
-    const results = {};
-    const processingInfos = [];
-
-    try {
-      // First check which messages we can process (not at capacity, have handlers, not already processing)
-      const availableSlotsCount = this._options.maxConcurrent - this._processingCount;
-
-      if (availableSlotsCount <= 0) {
-        logger.warn(
-          `Maximum concurrent processing limit (${this._options.maxConcurrent}) reached, delaying batch`
-        );
-        await new Promise(resolve => setTimeout(resolve, this._options.retryDelay));
-
-        // After delay, check again how many slots we have
-        const newAvailableSlotsCount = this._options.maxConcurrent - this._processingCount;
-        if (newAvailableSlotsCount <= 0) {
-          // Still no capacity
-          for (const msg of messages) {
-            results[msg.metadata.messageId] = false;
-          }
-          return results;
-        }
-      }
-
-      // Process our batch allocation in steps for better clarity
-      const messagesToProcess = await this._identifyMessagesToProcess(messages, results);
-      const processingStatuses = await this._checkProcessingStatus(messagesToProcess);
-      const readyMessages = await this._prepareMessagesForProcessing(
-        messagesToProcess,
-        processingStatuses,
-        results,
-        processingInfos
-      );
-
-      // Process the messages that are ready
-      await this._executeMessageProcessing(readyMessages, processingInfos, results);
-
-      return results;
-    } catch (error) {
-      logger.error('Error in batch message processing:', error);
-
-      // Mark all as failed
-      for (const info of processingInfos) {
-        results[info.metadata.messageId] = false;
-      }
-
-      return results;
-    }
-  }
-
-  /**
-   * Identify which messages can be processed based on handlers
-   * @param {Array<Object>} messages - Array of message objects
-   * @param {Object} results - Results object to be updated
-   * @returns {Array<Object>} - Filtered messages that can be processed
-   * @private
-   */
-  async _identifyMessagesToProcess(messages, results) {
-    const messagesToProcess = [];
-
-    for (const msg of messages) {
-      const { messageId, currentState, processingState, nextState } = msg.metadata;
-
-      // Check if we have a handler for this state transition
-      const stateKey = this._getStateTransitionKey(currentState, processingState, nextState);
-      if (!this._stateHandlers.has(stateKey)) {
-        logger.warn(`No handler found for state transition: ${stateKey}`);
-        results[messageId] = false;
-        continue;
-      }
-
-      messagesToProcess.push(msg);
-    }
-
-    return messagesToProcess;
-  }
-
-  /**
-   * Check which messages are already being processed
-   * @param {Array<Object>} messagesToProcess - Messages that can be processed
-   * @returns {Object} - Map of messageId to processing status
-   * @private
-   */
-  async _checkProcessingStatus(messagesToProcess) {
-    const messageInfos = messagesToProcess.map(msg => ({
-      messageId: msg.metadata.messageId,
-      processingState: msg.metadata.currentState,
-    }));
-
-    return await this._messageTracker.batchIsProcessing(messageInfos);
-  }
-
-  /**
-   * Prepare messages for processing by creating processing states
-   * @param {Array<Object>} messagesToProcess - Messages that can be processed
-   * @param {Object} processingStatuses - Map of messageId to processing status
-   * @param {Object} results - Results object to be updated
-   * @param {Array<Object>} processingInfos - Array to store processing info
-   * @returns {Array<Object>} - Messages ready for processing
-   * @private
-   */
-  async _prepareMessagesForProcessing(
-    messagesToProcess,
-    processingStatuses,
-    results,
-    processingInfos
-  ) {
-    const messagesToCreateState = [];
-
-    for (const msg of messagesToProcess) {
-      const { messageId, currentState } = msg.metadata;
-
-      if (processingStatuses[messageId]) {
-        logger.warn(
-          `Message ${messageId} already being processed in state ${currentState}, skipping`
-        );
-        results[messageId] = false;
-        continue;
-      }
-
-      messagesToCreateState.push({
-        messageId,
-        processingState: currentState,
-        metadata: {
-          processingState: msg.metadata.processingState,
-          nextState: msg.metadata.nextState,
-          startedAt: Date.now(),
-        },
-      });
-
-      processingInfos.push({
-        message: msg.content,
-        metadata: msg.metadata,
-      });
-    }
-
-    // Create processing states in batch
-    const createResults =
-      await this._messageTracker.batchCreateProcessingStates(messagesToCreateState);
-    return { createResults, processingInfos };
-  }
-
-  /**
-   * Execute message processing for the prepared messages
-   * @param {Object} readyMessages - Object containing createResults and processingInfos
-   * @param {Array<Object>} processingInfos - Array of processing info objects
-   * @param {Object} results - Results object to be updated
-   * @returns {Promise<void>}
-   * @private
-   */
-  async _executeMessageProcessing(readyMessages, processingInfos, results) {
-    const { createResults } = readyMessages;
-    const processingPromises = [];
-
-    for (const info of processingInfos) {
-      const { messageId } = info.metadata;
-
-      if (createResults[messageId]) {
-        // Increment processing count
-        this._processingCount++;
-
-        // Add to active processing tracking
-        const processingKey = `${messageId}:${info.metadata.currentState}`;
-        this._activeProcessing.set(processingKey, {
-          ...info.metadata,
-          startedAt: Date.now(),
-        });
-
-        // Process the message
-        processingPromises.push(
-          this.processMessage(info.message, info.metadata)
-            .then(success => {
-              results[messageId] = success;
-              if (success) this._successCount++;
-              else this._errorCount++;
-            })
-            .catch(error => {
-              logger.error(`Error in batch processing message ${messageId}:`, error);
-              results[messageId] = false;
-              this._errorCount++;
-            })
-            .finally(() => {
-              // Clean up tracking
-              this._processingCount--;
-              this._activeProcessing.delete(processingKey);
-            })
-        );
-      } else {
-        results[messageId] = false;
-      }
-    }
-
-    // Wait for all processing to complete
-    await Promise.all(processingPromises);
-  }
-
-  /**
    * Get statistics about message processing
    * @returns {Object} - Statistics object
    */
   getStats() {
+    // Create queue-specific stats
+    const queueStatsObj = {};
+    for (const [queueName, stats] of this._queueStats.entries()) {
+      const activeCount = Array.from(this._activeProcessing.values()).filter(
+        info => info.queueName === queueName
+      ).length;
+
+      queueStatsObj[queueName] = {
+        ...stats,
+        activeProcessing: activeCount,
+        successRate:
+          stats.processCount > 0
+            ? ((stats.successCount / stats.processCount) * 100).toFixed(2) + '%'
+            : '0%',
+      };
+    }
+
     return {
-      activeProcessing: this._processingCount,
-      activeMessages: Array.from(this._activeProcessing.values()),
+      totalActiveProcessing: this._processingCount,
       totalSuccess: this._successCount,
       totalErrors: this._errorCount,
       successRate:
         this._successCount + this._errorCount > 0
           ? ((this._successCount / (this._successCount + this._errorCount)) * 100).toFixed(2) + '%'
           : '0%',
-      registeredTransitions: Array.from(this._stateHandlers.keys()),
+      queueStats: queueStatsObj,
+      activeMessages: Array.from(this._activeProcessing.values()),
     };
   }
 
@@ -457,6 +316,16 @@ export default class Consumer {
   resetStats() {
     this._successCount = 0;
     this._errorCount = 0;
+
+    // Reset queue-specific stats
+    for (const [queueName, stats] of this._queueStats.entries()) {
+      this._queueStats.set(queueName, {
+        processCount: 0,
+        successCount: 0,
+        errorCount: 0,
+      });
+    }
+
     logger.info('Consumer statistics reset');
   }
 
@@ -465,17 +334,12 @@ export default class Consumer {
    * @returns {Promise<void>}
    */
   async shutdown() {
-    // Stop monitoring
     if (this._monitorInterval) {
       clearInterval(this._monitorInterval);
       this._monitorInterval = null;
     }
-
-    // Wait for active processing to complete
     if (this._processingCount > 0) {
       logger.info(`Waiting for ${this._processingCount} active processes to complete`);
-
-      // Wait up to 30 seconds for processing to complete
       const maxWaitTime = 30000;
       const startTime = Date.now();
 
@@ -494,93 +358,57 @@ export default class Consumer {
   }
 
   /**
-   * Start consuming messages from all queues
-   * @returns {Promise<void>}
-   */
-  async startConsuming() {
-    try {
-      // Get assigned queues from coordinator
-      const queues = await this._queueManager._coordinator.getAssignedQueues();
-
-      // Start consuming from all assigned queues
-      for (const queue of queues) {
-        await this._queueManager.startConsumingQueue(queue);
-      }
-
-      logger.info('Started consuming messages from assigned queues');
-    } catch (error) {
-      logger.error('Error starting message consumption:', error);
-      throw error;
-    }
-  }
-
-  /**
-   * Stop consuming messages from all queues
-   * @returns {Promise<void>}
-   */
-  async stopConsuming() {
-    try {
-      // Get active queues
-      const activeQueues = this._queueManager.getActiveQueues();
-
-      // If no active queues, log and return
-      if (activeQueues.length === 0) {
-        logger.info('No active queues to stop consuming from');
-        return;
-      }
-
-      // Stop consuming from all active queues
-      for (const queue of activeQueues) {
-        await this._queueManager.stopConsumingQueue(queue);
-      }
-
-      logger.info('Stopped consuming messages from all queues');
-    } catch (error) {
-      logger.error('Error stopping message consumption:', error);
-      throw error;
-    }
-  }
-
-  /**
-   * Register all handlers with the queue manager
-   * @private
-   */
-  _registerHandlersWithQueueManager() {
-    // Register each state handler with the queue manager
-    for (const [stateKey, handler] of this._stateHandlers.entries()) {
-      const [currentState, processingState, nextState] = stateKey.split(':');
-      this._registerHandlerWithQueueManager(currentState, processingState, nextState);
-    }
-  }
-
-  /**
    * Register a specific handler with the queue manager
+   * @param {string} queueName - Queue name
    * @param {string} currentState - Current state
    * @param {string} processingState - Processing state
    * @param {string} nextState - Next state
+   * @param {Object} [bindingInfo] - Optional queue binding information
+   * @param {number} [priority=1] - Queue priority
    * @private
    */
-  _registerHandlerWithQueueManager(currentState, processingState, nextState) {
+  _registerHandlerWithQueueManager(
+    queueName,
+    currentState,
+    processingState,
+    nextState,
+    bindingInfo = null,
+    priority = 1
+  ) {
     if (this._queueManager) {
+      // Get the state key
+      const stateKey = `${queueName}:${this._getStateTransitionKey(currentState, processingState, nextState)}`;
+
+      // Get the handler
+      const handlerInfo = this._stateHandlers.get(stateKey);
+      if (!handlerInfo) {
+        logger.warn(`No handler found for registration: ${stateKey}`);
+        return;
+      }
+
       // Wrap the handler to use our processMessage method
       const wrappedHandler = async (message, metadata) => {
         return await this.processMessage(message, {
           ...metadata,
+          queueName,
           currentState,
           processingState,
           nextState,
         });
       };
 
-      this._queueManager.registerStateHandler(
+      this._queueManager.registerQueueStateHandler(
+        queueName,
         currentState,
         processingState,
         nextState,
-        wrappedHandler
+        wrappedHandler,
+        bindingInfo,
+        priority
       );
 
       logger.debug(
-        `Registered handler with QueueManager: ${currentState} -> ${processingState} -> ${nextState}`
+        `Registered handler with QueueManager for queue ${queueName}: ${currentState} -> ${processingState} -> ${nextState}`
       );
     }
   }
@@ -609,67 +437,47 @@ export default class Consumer {
     const now = Date.now();
     const longRunningThreshold = 5 * 60 * 1000; // 5 minutes
 
-    let longRunningCount = 0;
+    // Group by queue
+    const queueCounts = {};
+    const longRunningByQueue = {};
 
     for (const [key, process] of this._activeProcessing.entries()) {
+      const { queueName } = process;
       const duration = now - process.startedAt;
 
+      // Initialize queue counters
+      if (!queueCounts[queueName]) {
+        queueCounts[queueName] = 0;
+        longRunningByQueue[queueName] = 0;
+      }
+
+      // Increment counters
+      queueCounts[queueName]++;
+
       if (duration > longRunningThreshold) {
-        longRunningCount++;
-        logger.warn(`Long-running process detected: ${process.messageId} (${duration}ms)`);
+        longRunningByQueue[queueName]++;
+        logger.warn(
+          `Long-running process detected in queue ${queueName}: ${process.messageId} (${duration}ms)`
+        );
       }
     }
 
-    if (this._processingCount > 0) {
-      logger.info(
-        `Active processing: ${this._processingCount} messages (${longRunningCount} long-running)`
-      );
+    // Log queue statistics
+    for (const [queueName, count] of Object.entries(queueCounts)) {
+      if (count > 0) {
+        logger.info(
+          `Queue ${queueName}: ${count} active messages (${longRunningByQueue[queueName]} long-running)`
+        );
+      }
     }
 
     // Log overall stats periodically
-    logger.info(
-      `Processing statistics: ${this._successCount} successful, ${this._errorCount} errors`
-    );
-  }
-
-  /**
-   * Implement message retry with exponential backoff
-   * @param {string} messageId - Message ID
-   * @param {string} currentState - Current state
-   * @param {Function} retryFunction - Function to retry
-   * @param {number} [initialDelayMs=1000] - Initial delay in milliseconds
-   * @param {number} [maxAttempts=3] - Maximum retry attempts
-   * @returns {Promise<any>} - Result of successful attempt or last error
-   */
-  async retryWithBackoff(
-    messageId,
-    currentState,
-    retryFunction,
-    initialDelayMs = 1000,
-    maxAttempts = 3
-  ) {
-    let attempts = 0;
-    let lastError = null;
-
-    while (attempts < maxAttempts) {
-      attempts++;
-      try {
-        return await retryFunction();
-      } catch (error) {
-        lastError = error;
-        logger.warn(
-          `Retry ${attempts}/${maxAttempts} failed for message ${messageId}: ${error.message}`
-        );
-
-        if (attempts < maxAttempts) {
-          const delayMs = initialDelayMs * Math.pow(2, attempts - 1);
-          logger.debug(`Waiting ${delayMs}ms before next retry for message ${messageId}`);
-          await new Promise(resolve => setTimeout(resolve, delayMs));
-        }
-      }
+    const queueStats = this.getStats().queueStats;
+    for (const [queueName, stats] of Object.entries(queueStats)) {
+      logger.info(
+        `Queue ${queueName} statistics: ${stats.successCount} successful, ${stats.errorCount} errors, ${stats.successRate} success rate`
+      );
     }
-
-    throw lastError || new Error(`All ${maxAttempts} retry attempts failed`);
   }
 
   /**

@@ -11,22 +11,27 @@ export default class Publisher {
    * Create a new Publisher instance
    * @param {RabbitMQClient} rabbitMQClient - RabbitMQ client instance
    * @param {MessageTracker} messageTracker - MessageTracker instance to check for duplicates
+   * @param {Coordinator} coordinator - Coordinator instance for queue priorities
    * @param {AppConfig} config - System configuration
    */
-  constructor(rabbitMQClient, messageTracker, config) {
+  constructor(rabbitMQClient, messageTracker, coordinator, config) {
     this._rabbitMQClient = rabbitMQClient;
     this._messageTracker = messageTracker;
+    this._coordinator = coordinator;
     this._options = {
-      defaultExchangeType: config.publisher.defaultExchangeType,
-      confirmPublish: config.publisher.confirmPublish,
-      defaultHeaders: config.publisher.defaultHeaders,
+      defaultExchangeType: config.publisher?.defaultExchangeType || 'direct',
+      confirmPublish: config.publisher?.confirmPublish,
+      defaultHeaders: config.publisher?.defaultHeaders || {},
     };
 
     this._exchanges = new Map();
     this._publishCount = 0;
     this._errorCount = 0;
 
-    logger.info('Publisher initialized');
+    logger.info(
+      'Publisher initialized with defaultExchangeType:',
+      this._options.defaultExchangeType
+    );
   }
 
   /**
@@ -42,6 +47,7 @@ export default class Publisher {
    * @param {string} options.nextState - Next state after processing
    * @param {Object} [options.headers] - Additional message headers
    * @param {Object} [options.publishOptions] - Additional publish options
+   * @param {number} [options.priority] - Queue priority (1=low, 2=medium, 3=high)
    * @returns {Promise<boolean>} - Success indicator
    */
   async publish(options) {
@@ -56,6 +62,7 @@ export default class Publisher {
       nextState,
       headers = {},
       publishOptions = {},
+      priority,
     } = options;
 
     this._validatePublishOptions(messageId, currentState, processingState, nextState);
@@ -64,7 +71,22 @@ export default class Publisher {
       if (await this._isDuplicateMessage(messageId, currentState)) {
         return false;
       }
-      await this._ensureExchangeExists(exchangeName, exchangeType);
+
+      // If a priority was specified, store the queue binding information with priority
+      if (priority && this._coordinator && routingKey && exchangeName) {
+        const bindingInfo = {
+          exchangeName,
+          routingKey,
+          exchangeType,
+        };
+
+        // Note: This assumes the routingKey is the queue name, which is common but not guaranteed
+        // In a real system, you might need more mapping info
+        await this._coordinator.setQueuePriority(routingKey, priority, bindingInfo);
+      }
+
+      // Use safe exchange initialization to handle type mismatches
+      await this._safeEnsureExchangeExists(exchangeName, exchangeType);
       const messageContent = this._prepareMessageContent(message, {
         messageId,
         currentState,
@@ -119,6 +141,7 @@ export default class Publisher {
    * @param {string} options.nextState - Next state after processing
    * @param {Object} [options.headers] - Additional message headers
    * @param {Object} [options.publishOptions] - Additional publish options
+   * @param {number} [options.priority] - Queue priority (1=low, 2=medium, 3=high)
    * @returns {Promise<boolean>} - Success indicator
    */
   async publishToQueue(options) {
@@ -131,6 +154,7 @@ export default class Publisher {
       nextState,
       headers = {},
       publishOptions = {},
+      priority,
     } = options;
 
     // Validate required fields
@@ -142,8 +166,13 @@ export default class Publisher {
         return false;
       }
 
-      // Ensure queue exists
-      await this._rabbitMQClient.assertQueue(queueName);
+      // If a priority was specified, store it
+      if (priority && this._coordinator) {
+        await this._coordinator.setQueuePriority(queueName, priority);
+      }
+
+      // Ensure queue exists with retry mechanism
+      await this._safeAssertQueue(queueName);
 
       // Prepare message content and options
       const messageContent = this._prepareMessageContent(message, {
@@ -189,153 +218,6 @@ export default class Publisher {
   }
 
   /**
-   * Publish a batch of messages with the same state transition
-   * @param {Array<Object>} messages - Array of message objects
-   * @param {string} exchangeName - Exchange name
-   * @param {string} routingKey - Routing key
-   * @param {string} currentState - Current state for all messages
-   * @param {string} processingState - Processing state for all messages
-   * @param {string} nextState - Next state for all messages
-   * @param {Object} [options] - Additional options
-   * @returns {Promise<Array<Object>>} - Array of results
-   */
-  async publishBatch(
-    messages,
-    exchangeName,
-    routingKey,
-    currentState,
-    processingState,
-    nextState,
-    options = {}
-  ) {
-    if (!Array.isArray(messages) || messages.length === 0) {
-      throw new Error('Messages must be a non-empty array');
-    }
-
-    // Check for processing statuses in batch for efficiency
-    const messagesToCheck = messages.map(msg => ({
-      messageId: msg.id,
-      processingState: currentState,
-    }));
-
-    const processingStatuses = await this._getProcessingStatusesForBatch(messagesToCheck);
-    return await this._processMessageBatch(
-      messages,
-      processingStatuses,
-      exchangeName,
-      routingKey,
-      currentState,
-      processingState,
-      nextState,
-      options
-    );
-  }
-
-  /**
-   * Get processing statuses for a batch of messages
-   * @param {Array<Object>} messagesToCheck - Array of {messageId, processingState} objects
-   * @returns {Promise<Object>} - Map of messageId to processing status
-   * @private
-   */
-  async _getProcessingStatusesForBatch(messagesToCheck) {
-    const processingStatuses = {};
-
-    if (this._messageTracker) {
-      const batchStatus = await this._messageTracker.batchIsProcessing(messagesToCheck);
-      Object.assign(processingStatuses, batchStatus);
-    }
-
-    return processingStatuses;
-  }
-
-  /**
-   * Process a batch of messages
-   * @param {Array<Object>} messages - Array of message objects
-   * @param {Object} processingStatuses - Map of messageId to processing status
-   * @param {string} exchangeName - Exchange name
-   * @param {string} routingKey - Routing key
-   * @param {string} currentState - Current state for all messages
-   * @param {string} processingState - Processing state for all messages
-   * @param {string} nextState - Next state for all messages
-   * @param {Object} options - Additional options
-   * @returns {Promise<Array<Object>>} - Array of results
-   * @private
-   */
-  async _processMessageBatch(
-    messages,
-    processingStatuses,
-    exchangeName,
-    routingKey,
-    currentState,
-    processingState,
-    nextState,
-    options
-  ) {
-    const results = [];
-    const exchangeType = options.exchangeType || this._options.defaultExchangeType;
-
-    // Ensure exchange exists
-    if (exchangeName) {
-      await this._ensureExchangeExists(exchangeName, exchangeType);
-    }
-
-    // Process each message
-    for (const msg of messages) {
-      try {
-        if (!msg.id) {
-          throw new Error('Each message must have an id property');
-        }
-
-        // Skip if already processing
-        if (processingStatuses[msg.id]) {
-          logger.warn(
-            `Message ${msg.id} is already being processed in state ${currentState}, skipping`
-          );
-
-          results.push({
-            id: msg.id,
-            success: false,
-            skipped: true,
-            error: 'Message already being processed',
-          });
-
-          continue;
-        }
-
-        const publishResult = await this.publish({
-          exchangeName,
-          exchangeType,
-          routingKey,
-          message: msg.content || msg,
-          messageId: msg.id,
-          currentState,
-          processingState,
-          nextState,
-          headers: msg.headers || {},
-          publishOptions: msg.options || {},
-        });
-
-        results.push({
-          id: msg.id,
-          success: true,
-          result: publishResult,
-        });
-      } catch (error) {
-        results.push({
-          id: msg.id,
-          success: false,
-          error: error.message,
-        });
-      }
-    }
-
-    const successCount = results.filter(r => r.success).length;
-    logger.info(`Published batch: ${successCount}/${messages.length} successful`);
-
-    return results;
-  }
-
-  /**
    * Get publishing statistics
    * @returns {Object} - Statistics object
    */
@@ -343,7 +225,10 @@ export default class Publisher {
     return {
       publishCount: this._publishCount,
       errorCount: this._errorCount,
-      declaredExchanges: Array.from(this._exchanges.keys()),
+      declaredExchanges: Array.from(this._exchanges.entries()).map(([name, type]) => ({
+        name,
+        type,
+      })),
     };
   }
 
@@ -395,16 +280,86 @@ export default class Publisher {
   }
 
   /**
-   * Ensure an exchange exists
+   * Safely ensure an exchange exists, handling type mismatches
    * @param {string} exchangeName - Exchange name
-   * @param {string} exchangeType - Exchange type
+   * @param {string} exchangeType - Desired exchange type
+   * @returns {Promise<string>} - The actual exchange type used
+   * @private
+   */
+  async _safeEnsureExchangeExists(exchangeName, exchangeType) {
+    if (!exchangeName) return exchangeType;
+
+    // If we already know this exchange, use the known type
+    if (this._exchanges.has(exchangeName)) {
+      const existingType = this._exchanges.get(exchangeName);
+      if (existingType !== exchangeType) {
+        logger.warn(
+          `Using existing exchange type '${existingType}' for exchange '${exchangeName}' instead of requested '${exchangeType}'`
+        );
+      }
+      return existingType;
+    }
+
+    try {
+      // Try to create with requested type
+      await this._rabbitMQClient.assertExchange(exchangeName, exchangeType);
+      this._exchanges.set(exchangeName, exchangeType);
+      return exchangeType;
+    } catch (error) {
+      // Check if error is due to type mismatch
+      if (
+        error.message &&
+        error.message.includes('PRECONDITION_FAILED') &&
+        error.message.includes("inequivalent arg 'type'")
+      ) {
+        // Extract the actual type from error message
+        const match = error.message.match(/received '(\w+)' but current is '(\w+)'/);
+        if (match && match[2]) {
+          const actualType = match[2];
+          logger.warn(
+            `Exchange '${exchangeName}' exists with type '${actualType}'. Adapting to use this type.`
+          );
+
+          // Try again with the actual type
+          try {
+            await this._rabbitMQClient.assertExchange(exchangeName, actualType);
+            this._exchanges.set(exchangeName, actualType);
+            return actualType;
+          } catch (retryError) {
+            logger.error(`Failed to assert exchange with actual type:`, retryError);
+            throw retryError;
+          }
+        }
+      }
+
+      logger.error(`Error ensuring exchange ${exchangeName} exists:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Safely assert a queue exists with retry mechanism
+   * @param {string} queueName - Queue name
    * @returns {Promise<void>}
    * @private
    */
-  async _ensureExchangeExists(exchangeName, exchangeType) {
-    if (exchangeName && !this._exchanges.has(exchangeName)) {
-      await this._rabbitMQClient.assertExchange(exchangeName, exchangeType);
-      this._exchanges.set(exchangeName, exchangeType);
+  async _safeAssertQueue(queueName) {
+    try {
+      await this._rabbitMQClient.assertQueue(queueName);
+    } catch (error) {
+      logger.error(`Error asserting queue ${queueName}:`, error);
+
+      // If we get a connection error, wait and retry once
+      if (
+        error.message &&
+        (error.message.includes('Connection closed') || error.message.includes('Channel closed'))
+      ) {
+        logger.info(`Retrying queue assertion for ${queueName} after connection issue`);
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        await this._rabbitMQClient.assertQueue(queueName);
+      } else {
+        throw error;
+      }
     }
   }
 
@@ -496,41 +451,5 @@ export default class Publisher {
     }
 
     return 'application/octet-stream';
-  }
-
-  /**
-   * Implement retry for publishing with exponential backoff
-   * @param {Function} publishFunc - Publishing function to retry
-   * @param {number} [maxRetries=3] - Maximum retry attempts
-   * @param {number} [initialDelayMs=100] - Initial delay in milliseconds
-   * @returns {Promise<boolean>} - Success indicator
-   */
-  async publishWithRetry(publishFunc, maxRetries = 3, initialDelayMs = 100) {
-    let retryCount = 0;
-    let lastError = null;
-
-    while (retryCount <= maxRetries) {
-      try {
-        return await publishFunc();
-      } catch (error) {
-        lastError = error;
-        retryCount++;
-
-        if (retryCount > maxRetries) {
-          logger.error(`Publishing failed after ${maxRetries} retries:`, error);
-          break;
-        }
-
-        const delay = initialDelayMs * Math.pow(2, retryCount - 1);
-        logger.warn(
-          `Publish attempt ${retryCount} failed, retrying in ${delay}ms: ${error.message}`
-        );
-
-        await new Promise(resolve => setTimeout(resolve, delay));
-      }
-    }
-
-    // If we got here, all retries failed
-    throw lastError || new Error(`Publishing failed after ${maxRetries} retries`);
   }
 }

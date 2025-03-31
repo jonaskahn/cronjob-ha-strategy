@@ -13,12 +13,12 @@ const colors = {
 
 // NAT mapping to convert internal IPs to localhost ports
 const natMapping = {
-  '172.18.0.2:6379': { host: 'localhost', port: 6379 },
-  '172.18.0.3:6379': { host: 'localhost', port: 6380 },
-  '172.18.0.4:6379': { host: 'localhost', port: 6381 },
-  '172.18.0.5:6379': { host: 'localhost', port: 6382 },
-  '172.18.0.6:6379': { host: 'localhost', port: 6383 },
-  '172.18.0.7:6379': { host: 'localhost', port: 6384 },
+  '172.19.0.2:6379': { host: 'localhost', port: 6379 },
+  '172.19.0.3:6379': { host: 'localhost', port: 6380 },
+  '172.19.0.4:6379': { host: 'localhost', port: 6381 },
+  '172.19.0.5:6379': { host: 'localhost', port: 6382 },
+  '172.19.0.6:6379': { host: 'localhost', port: 6383 },
+  '172.19.0.7:6379': { host: 'localhost', port: 6384 },
 };
 
 // Configuration for Redis Cluster

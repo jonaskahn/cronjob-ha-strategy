@@ -19,17 +19,22 @@ export default class QueueManager {
     this._coordinator = coordinator;
     this._messageTracker = messageTracker;
     this._options = {
-      prefetch: config.rabbitmq.prefetch,
-      defaultQueueOptions: config.rabbitmq.defaultQueueOptions,
-      defaultExchangeOptions: config.rabbitmq.defaultExchangeOptions,
+      prefetch: config.rabbitmq?.prefetch || 10,
+      defaultQueueOptions: config.rabbitmq?.defaultQueueOptions || { durable: true },
+      defaultExchangeOptions: config.rabbitmq?.defaultExchangeOptions || { durable: true },
+      defaultExchangeType: config.rabbitmq?.defaultExchangeType || 'direct',
     };
 
     this._stateHandlers = new Map();
     this._activeConsumers = new Map();
     this._declaredQueues = new Set();
+    this._declaredExchanges = new Map();
 
     this._coordinator.onAssignmentChanged = this._handleAssignmentChange.bind(this);
-    logger.info('QueueManager initialized');
+    logger.info(
+      'QueueManager initialized with defaultExchangeType:',
+      this._options.defaultExchangeType
+    );
   }
 
   /**
@@ -38,7 +43,7 @@ export default class QueueManager {
    */
   async initialize() {
     try {
-      await this._coordinator.register();
+      // Get assigned queues from coordinator
       const assignedQueues = await this._coordinator.getAssignedQueues();
 
       if (assignedQueues.length > 0) {
@@ -57,18 +62,44 @@ export default class QueueManager {
   }
 
   /**
-   * Register a handler for a specific state transition
+   * Register a handler for a specific queue and state transition
+   * @param {string} queueName - Queue name
    * @param {string} currentState - Current state
    * @param {string} processingState - Processing state
    * @param {string} nextState - Next (final) state
    * @param {Function} handler - Handler function (message, metadata) => Promise<void>
+   * @param {Object} [bindingInfo] - Optional queue binding information
+   * @param {string} bindingInfo.exchangeName - Exchange name
+   * @param {string} bindingInfo.routingKey - Routing key
+   * @param {string} [bindingInfo.exchangeType] - Exchange type (direct, topic, fanout)
+   * @param {number} [priority=1] - Queue priority (1=low, 2=medium, 3=high)
    */
-  registerStateHandler(currentState, processingState, nextState, handler) {
-    const stateKey = this._getStateTransitionKey(currentState, processingState, nextState);
+  registerQueueStateHandler(
+    queueName,
+    currentState,
+    processingState,
+    nextState,
+    handler,
+    bindingInfo = null,
+    priority = 1
+  ) {
+    const stateKey = `${queueName}:${this._getStateTransitionKey(currentState, processingState, nextState)}`;
     this._stateHandlers.set(stateKey, handler);
 
+    // Register binding information with coordinator if provided
+    if (bindingInfo) {
+      this._coordinator
+        .setQueuePriority(queueName, priority, bindingInfo)
+        .catch(error => logger.error(`Error registering binding for queue ${queueName}:`, error));
+    } else {
+      // Just set priority without binding info
+      this._coordinator
+        .setQueuePriority(queueName, priority)
+        .catch(error => logger.error(`Error setting priority for queue ${queueName}:`, error));
+    }
+
     logger.info(
-      `Registered handler for state transition: ${currentState} -> ${processingState} -> ${nextState}`
+      `Registered handler for queue ${queueName} state transition: ${currentState} -> ${processingState} -> ${nextState}`
     );
   }
 
@@ -91,10 +122,31 @@ export default class QueueManager {
         return null;
       }
 
-      // Ensure queue exists
+      // Get binding information for this queue
+      const bindingInfo = await this._coordinator.getQueueBinding(queueName);
+
+      // First ensure queue exists
       if (!this._declaredQueues.has(queueName)) {
-        await this._rabbitMQClient.assertQueue(queueName, this._options.defaultQueueOptions);
+        await this._safeAssertQueue(queueName);
         this._declaredQueues.add(queueName);
+      }
+
+      // Then create binding if binding info exists
+      if (bindingInfo) {
+        try {
+          await this.bindQueueToExchange(
+            queueName,
+            bindingInfo.exchangeName,
+            bindingInfo.routingKey,
+            bindingInfo.exchangeType
+          );
+          logger.info(
+            `Created binding for queue ${queueName} to exchange ${bindingInfo.exchangeName}`
+          );
+        } catch (bindError) {
+          logger.error(`Error creating binding for queue ${queueName}:`, bindError);
+          // Continue even if binding fails - we can still consume from the queue
+        }
       }
 
       // Start consuming from the queue
@@ -106,10 +158,17 @@ export default class QueueManager {
 
       // Track active consumer
       this._activeConsumers.set(queueName, consumerTag);
-      logger.info(`Started consuming from queue ${queueName} with tag ${consumerTag}`);
+
+      // Make this log more visible for initial consumption
+      logger.info('========================================');
+      logger.info(`✅ STARTED CONSUMING FROM QUEUE: ${queueName}`);
+      logger.info(`   Consumer Tag: ${consumerTag}`);
+      logger.info(`   Prefetch: ${this._options.prefetch}`);
+      logger.info('========================================');
+
       return consumerTag;
     } catch (error) {
-      logger.error(`Error starting consumption from queue ${queueName}:`, error);
+      logger.error(`❌ ERROR STARTING CONSUMPTION FROM QUEUE ${queueName}:`, error);
       throw error;
     }
   }
@@ -121,18 +180,12 @@ export default class QueueManager {
    */
   async stopConsumingQueue(queueName) {
     try {
-      // Check if consuming
       if (!this._activeConsumers.has(queueName)) {
         logger.debug(`Not consuming from queue ${queueName}, nothing to stop`);
         return true;
       }
-
-      // Cancel consumer
-      await this._rabbitMQClient.cancelConsumer(queueName);
-
-      // Remove from active consumers
+      await this._rabbitMQClient.cancelConsumer(this._activeConsumers.get(queueName));
       this._activeConsumers.delete(queueName);
-
       logger.info(`Stopped consuming from queue ${queueName}`);
       return true;
     } catch (error) {
@@ -150,20 +203,134 @@ export default class QueueManager {
   }
 
   /**
+   * Bind a queue to an exchange with routing key
+   * @param {string} queueName - Queue name
+   * @param {string} exchangeName - Exchange name
+   * @param {string} routingKey - Routing key
+   * @param {string} [exchangeType] - Optional exchange type (defaults to config)
+   * @returns {Promise<boolean>} - Success indicator
+   */
+  async bindQueueToExchange(queueName, exchangeName, routingKey, exchangeType = null) {
+    try {
+      // Ensure queue exists
+      if (!this._declaredQueues.has(queueName)) {
+        await this._safeAssertQueue(queueName);
+        this._declaredQueues.add(queueName);
+      }
+
+      // Use safe exchange assertion with type adaptation
+      const actualExchangeType = await this._safeEnsureExchangeExists(
+        exchangeName,
+        exchangeType || this._options.defaultExchangeType
+      );
+
+      // Bind the queue
+      await this._rabbitMQClient.bindQueue(queueName, exchangeName, routingKey);
+
+      logger.info(
+        `Bound queue ${queueName} to exchange ${exchangeName} with routing key ${routingKey}`
+      );
+      return true;
+    } catch (error) {
+      logger.error(`Error binding queue ${queueName} to exchange ${exchangeName}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Safely ensure an exchange exists, handling type mismatches
+   * @param {string} exchangeName - Exchange name
+   * @param {string} exchangeType - Desired exchange type
+   * @returns {Promise<string>} - The actual exchange type used
+   * @private
+   */
+  async _safeEnsureExchangeExists(exchangeName, exchangeType) {
+    if (!exchangeName) return exchangeType;
+
+    // If we already know this exchange, use the known type
+    if (this._declaredExchanges.has(exchangeName)) {
+      const existingType = this._declaredExchanges.get(exchangeName);
+      if (existingType !== exchangeType) {
+        logger.warn(
+          `Using existing exchange type '${existingType}' for exchange '${exchangeName}' instead of requested '${exchangeType}'`
+        );
+      }
+      return existingType;
+    }
+
+    try {
+      // Try to create with requested type
+      await this._rabbitMQClient.assertExchange(exchangeName, exchangeType);
+      this._declaredExchanges.set(exchangeName, exchangeType);
+      return exchangeType;
+    } catch (error) {
+      // Check if error is due to type mismatch
+      if (
+        error.message &&
+        error.message.includes('PRECONDITION_FAILED') &&
+        error.message.includes("inequivalent arg 'type'")
+      ) {
+        // Extract the actual type from error message
+        const match = error.message.match(/received '(\w+)' but current is '(\w+)'/);
+        if (match && match[2]) {
+          const actualType = match[2];
+          logger.warn(
+            `Exchange '${exchangeName}' exists with type '${actualType}'. Adapting to use this type.`
+          );
+
+          // Try again with the actual type
+          try {
+            await this._rabbitMQClient.assertExchange(exchangeName, actualType);
+            this._declaredExchanges.set(exchangeName, actualType);
+            return actualType;
+          } catch (retryError) {
+            logger.error(`Failed to assert exchange with actual type:`, retryError);
+            throw retryError;
+          }
+        }
+      }
+
+      logger.error(`Error ensuring exchange ${exchangeName} exists:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Safely assert a queue exists with retry mechanism
+   * @param {string} queueName - Queue name
+   * @returns {Promise<void>}
+   * @private
+   */
+  async _safeAssertQueue(queueName) {
+    try {
+      await this._rabbitMQClient.assertQueue(queueName, this._options.defaultQueueOptions);
+    } catch (error) {
+      logger.error(`Error asserting queue ${queueName}:`, error);
+
+      // If we get a connection error, wait and retry once
+      if (
+        error.message &&
+        (error.message.includes('Connection closed') || error.message.includes('Channel closed'))
+      ) {
+        logger.info(`Retrying queue assertion for ${queueName} after connection issue`);
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        await this._rabbitMQClient.assertQueue(queueName, this._options.defaultQueueOptions);
+      } else {
+        throw error;
+      }
+    }
+  }
+
+  /**
    * Shutdown QueueManager and clean up resources
    * @returns {Promise<void>}
    */
   async shutdown() {
     try {
-      // Stop all consumers
       const activeQueues = this.getActiveQueues();
       for (const queueName of activeQueues) {
         await this.stopConsumingQueue(queueName);
       }
-
-      // Deregister from coordinator
-      await this._coordinator.deregister();
-
       logger.info('QueueManager shutdown complete');
     } catch (error) {
       logger.error('Error during QueueManager shutdown:', error);
@@ -187,21 +354,54 @@ export default class QueueManager {
       // Find queues to start consuming
       const queuesToStart = newQueues.filter(q => !currentQueues.includes(q));
 
-      // Stop consuming from removed queues
-      for (const queueName of queuesToStop) {
-        await this.stopConsumingQueue(queueName);
+      if (queuesToStop.length > 0 || queuesToStart.length > 0) {
+        logger.info('========================================');
+        logger.info('QUEUE ASSIGNMENT CHANGE DETECTED');
+        logger.info('========================================');
       }
 
-      // Start consuming from new queues
-      for (const queueName of queuesToStart) {
-        await this.startConsumingQueue(queueName);
+      // Stop consuming from removed queues - with individual error handling
+      if (queuesToStop.length > 0) {
+        logger.info(`STOPPING CONSUMPTION OF ${queuesToStop.length} QUEUES:`);
+        queuesToStop.forEach(q => logger.info(`   - ${q}`));
+
+        for (const queueName of queuesToStop) {
+          try {
+            await this.stopConsumingQueue(queueName);
+            logger.info(`✅ Stopped consuming from queue: ${queueName}`);
+          } catch (stopError) {
+            logger.error(`❌ Failed to stop queue ${queueName}:`, stopError);
+            // Continue trying to stop other queues despite this error
+          }
+        }
       }
 
-      logger.info(
-        `Queue assignments updated: Stopped ${queuesToStop.length}, Started ${queuesToStart.length}`
-      );
+      // Start consuming from new queues - with individual error handling
+      if (queuesToStart.length > 0) {
+        logger.info(`STARTING CONSUMPTION OF ${queuesToStart.length} QUEUES:`);
+        queuesToStart.forEach(q => logger.info(`   - ${q}`));
+
+        for (const queueName of queuesToStart) {
+          try {
+            await this.startConsumingQueue(queueName);
+            logger.info(`✅ Started consuming from queue: ${queueName}`);
+          } catch (startError) {
+            logger.error(`❌ Failed to start queue ${queueName}:`, startError);
+            // Continue trying to start other queues despite this error
+          }
+        }
+      }
+
+      if (queuesToStop.length > 0 || queuesToStart.length > 0) {
+        logger.info('========================================');
+        logger.info(
+          `QUEUE ASSIGNMENTS UPDATED: Stopped ${queuesToStop.length}, Started ${queuesToStart.length}`
+        );
+        logger.info(`CURRENT ACTIVE QUEUES: ${this.getActiveQueues().join(', ')}`);
+        logger.info('========================================');
+      }
     } catch (error) {
-      logger.error('Error handling assignment change:', error);
+      logger.error('❌ ERROR HANDLING ASSIGNMENT CHANGE:', error);
     }
   }
 
@@ -234,38 +434,46 @@ export default class QueueManager {
     }
 
     try {
-      // Process the message through multiple stages
-      if (await this._isMessageAlreadyProcessing(messageId, currentState)) {
-        await message.ack(); // Acknowledge to remove from queue
-        return;
+      // Find the queue-specific state handler
+      const stateKey = `${queueName}:${this._getStateTransitionKey(currentState, processingState, nextState)}`;
+
+      if (this._stateHandlers.has(stateKey)) {
+        const handler = this._stateHandlers.get(stateKey);
+
+        // Parse message content
+        let content;
+        try {
+          content = message.json();
+        } catch (error) {
+          content = message.content.toString();
+        }
+
+        // Process message with handler
+        await handler(content, {
+          messageId,
+          queueName,
+          currentState,
+          processingState,
+          nextState,
+          headers,
+        });
+
+        // Acknowledgement is handled by the handler
+      } else {
+        logger.warn(
+          `No handler for queue ${queueName} state transition: ${currentState} -> ${processingState} -> ${nextState}`
+        );
+
+        await message.reject(false); // Don't requeue
       }
-
-      // Create processing state in Redis
-      await this._createProcessingState(
-        messageId,
-        currentState,
-        processingState,
-        nextState,
-        queueName
-      );
-
-      // Find and execute handler
-      await this._executeMessageHandler(
-        message,
-        messageId,
-        currentState,
-        processingState,
-        nextState,
-        headers,
-        queueName
-      );
     } catch (error) {
       logger.error(`Error processing message ${messageId} from queue ${queueName}:`, error);
+      try {
+        await this._messageTracker.deleteProcessingState(messageId, currentState);
+      } catch (redisError) {
+        logger.warn(`Error cleaning up processing state: ${redisError.message}`);
+      }
 
-      // Delete processing state on error
-      await this._messageTracker.deleteProcessingState(messageId, currentState);
-
-      // Reject message
       await message.reject(false); // Don't requeue
     }
   }
@@ -301,108 +509,6 @@ export default class QueueManager {
     }
 
     return true;
-  }
-
-  /**
-   * Check if message is already being processed
-   * @param {string} messageId - Message ID
-   * @param {string} currentState - Current state
-   * @returns {Promise<boolean>} - True if already processing
-   * @private
-   */
-  async _isMessageAlreadyProcessing(messageId, currentState) {
-    const isProcessing = await this._messageTracker.isProcessing(messageId, currentState);
-    if (isProcessing) {
-      logger.warn(
-        `Message ${messageId} already being processed in state ${currentState}, skipping`
-      );
-      return true;
-    }
-    return false;
-  }
-
-  /**
-   * Create processing state for a message
-   * @param {string} messageId - Message ID
-   * @param {string} currentState - Current state
-   * @param {string} processingState - Processing state
-   * @param {string} nextState - Next state
-   * @param {string} queueName - Queue name
-   * @returns {Promise<void>}
-   * @private
-   */
-  async _createProcessingState(messageId, currentState, processingState, nextState, queueName) {
-    await this._messageTracker.createProcessingState(messageId, currentState, {
-      processingState,
-      nextState,
-      queueName,
-      startedAt: Date.now(),
-    });
-  }
-
-  /**
-   * Execute the appropriate handler for a message
-   * @param {Object} message - RabbitMQ message
-   * @param {string} messageId - Message ID
-   * @param {string} currentState - Current state
-   * @param {string} processingState - Processing state
-   * @param {string} nextState - Next state
-   * @param {Object} headers - Message headers
-   * @param {string} queueName - Queue name
-   * @returns {Promise<void>}
-   * @private
-   */
-  async _executeMessageHandler(
-    message,
-    messageId,
-    currentState,
-    processingState,
-    nextState,
-    headers,
-    queueName
-  ) {
-    const stateKey = this._getStateTransitionKey(currentState, processingState, nextState);
-
-    if (this._stateHandlers.has(stateKey)) {
-      const handler = this._stateHandlers.get(stateKey);
-
-      // Parse message content
-      let content;
-      try {
-        content = message.json();
-      } catch (error) {
-        content = message.content.toString();
-      }
-
-      // Process message
-      await handler(content, {
-        messageId,
-        currentState,
-        processingState,
-        nextState,
-        headers,
-        queueName,
-      });
-
-      // Delete processing state from Redis
-      await this._messageTracker.deleteProcessingState(messageId, currentState);
-
-      // Acknowledge message
-      await message.ack();
-
-      logger.debug(
-        `Successfully processed message ${messageId} with state transition: ${currentState} -> ${processingState} -> ${nextState}`
-      );
-    } else {
-      logger.warn(
-        `No handler for state transition: ${currentState} -> ${processingState} -> ${nextState}`
-      );
-
-      // Delete processing state since we're not handling it
-      await this._messageTracker.deleteProcessingState(messageId, currentState);
-
-      await message.reject(false); // Don't requeue
-    }
   }
 
   /**

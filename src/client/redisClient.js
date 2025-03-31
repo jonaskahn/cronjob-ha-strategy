@@ -1,13 +1,13 @@
-// redisClient.js
 import getLogger from '../utils/logger.js';
 import Redis from 'ioredis';
+import appConfig from '../utils/appConfig.js';
 
 const logger = getLogger('client/RedisClient');
 
 /**
  * Client for interacting with Redis for temporary state storage
  */
-export default class RedisClient {
+export class RedisClient {
   /**
    * Create a new RedisClient
    * @param {AppConfig} config - System configuration
@@ -292,3 +292,6 @@ export default class RedisClient {
     }
   }
 }
+
+const redisClient = new RedisClient(appConfig);
+export default redisClient;

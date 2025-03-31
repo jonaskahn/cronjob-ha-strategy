@@ -9,8 +9,8 @@ services:
     ports:
       - '6379:6379'
     networks:
-      redis-cluster-network:
-        ipv4_address: 172.18.0.2 # IP for master of slots 0-5460
+      redis-network:
+        ipv4_address: 172.19.0.2 # IP for master of slots 0-5460
     environment:
       - 'ALLOW_EMPTY_PASSWORD=yes'
       - 'REDIS_REPLICATION_MODE=slave'
@@ -24,8 +24,8 @@ services:
     ports:
       - '6380:6379'
     networks:
-      redis-cluster-network:
-        ipv4_address: 172.18.0.3 # IP for master of slots 5461-10922
+      redis-network:
+        ipv4_address: 172.19.0.3 # IP for master of slots 5461-10922
     environment:
       - 'ALLOW_EMPTY_PASSWORD=yes'
       - 'REDIS_REPLICATION_MODE=slave'
@@ -39,8 +39,8 @@ services:
     ports:
       - '6381:6379'
     networks:
-      redis-cluster-network:
-        ipv4_address: 172.18.0.4 # IP for master of slots 10923-16383
+      redis-network:
+        ipv4_address: 172.19.0.4 # IP for master of slots 10923-16383
     environment:
       - 'ALLOW_EMPTY_PASSWORD=yes'
       - 'REDIS_REPLICATION_MODE=slave'
@@ -54,8 +54,8 @@ services:
     ports:
       - '6382:6379'
     networks:
-      redis-cluster-network:
-        ipv4_address: 172.18.0.5 # IP for slave of master 800b96e0
+      redis-network:
+        ipv4_address: 172.19.0.5 # IP for slave of master 800b96e0
     environment:
       - 'ALLOW_EMPTY_PASSWORD=yes'
       - 'REDIS_REPLICATION_MODE=master'
@@ -69,8 +69,8 @@ services:
     ports:
       - '6383:6379'
     networks:
-      redis-cluster-network:
-        ipv4_address: 172.18.0.6 # IP for slave of master 9d7fcbfd
+      redis-network:
+        ipv4_address: 172.19.0.6 # IP for slave of master 9d7fcbfd
     environment:
       - 'ALLOW_EMPTY_PASSWORD=yes'
       - 'REDIS_REPLICATION_MODE=master'
@@ -84,8 +84,8 @@ services:
     ports:
       - '6384:6379'
     networks:
-      redis-cluster-network:
-        ipv4_address: 172.18.0.7 # IP for slave of master cf33edb5
+      redis-network:
+        ipv4_address: 172.19.0.7 # IP for slave of master cf33edb5
     depends_on:
       - redis-node-0
       - redis-node-1
@@ -100,12 +100,12 @@ services:
       - 'REDIS_CLUSTER_CREATOR=yes'
 
 networks:
-  redis-cluster-network:
+  redis-network:
     driver: bridge
     ipam:
       driver: default
       config:
-        - subnet: 172.18.0.0/16 # Define the subnet for fixed IPs
+        - subnet: 172.19.0.0/16
 
 volumes:
   redis-cluster_data-0:

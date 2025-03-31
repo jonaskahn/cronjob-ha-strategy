@@ -24,12 +24,12 @@ export class AppConfig {
         ['localhost:6379', 'localhost:6380', 'localhost:6381']
       ),
       natMap: {
-        '172.18.0.2:6379': { host: 'localhost', port: 6379 },
-        '172.18.0.3:6379': { host: 'localhost', port: 6380 },
-        '172.18.0.4:6379': { host: 'localhost', port: 6381 },
-        '172.18.0.5:6379': { host: 'localhost', port: 6382 },
-        '172.18.0.6:6379': { host: 'localhost', port: 6383 },
-        '172.18.0.7:6379': { host: 'localhost', port: 6384 },
+        '172.19.0.2:6379': { host: 'localhost', port: 6379 },
+        '172.19.0.3:6379': { host: 'localhost', port: 6380 },
+        '172.19.0.4:6379': { host: 'localhost', port: 6381 },
+        '172.19.0.5:6379': { host: 'localhost', port: 6382 },
+        '172.19.0.6:6379': { host: 'localhost', port: 6383 },
+        '172.19.0.7:6379': { host: 'localhost', port: 6384 },
       },
     };
 
@@ -49,7 +49,7 @@ export class AppConfig {
       defaultExchangeType:
         options?.rabbitmq?.exchangeType ||
         process.env.CHJS_RABBITMQ_DEFAULT_EXCHANGE_TYPE ||
-        'topic',
+        'direct', // Changed from 'topic' to 'direct'
       defaultExchangeOptions: {
         durable: true,
         autoDelete: false,
@@ -64,8 +64,9 @@ export class AppConfig {
       consumerPrefix: options?.coordinator?.consumerPrefix || '/rabbitmq-consumers/',
       queueAssignmentPrefix: options?.coordinator?.queueAssignmentPrefix || '/queue-assignments/',
       queueConfigPrefix: options?.coordinator?.queueConfigPrefix || '/queue-configs/',
-      leaseTTLInSeconds: options?.coordinator?.leaseTTL || 30,
-      heartbeatIntervalInMs: options?.coordinator?.heartbeatInterval || 10_000,
+      leaseTTLInSeconds: options?.coordinator?.leaseTTL || 60, // Increased from 30 to 60
+      heartbeatIntervalInMs: options?.coordinator?.heartbeatInterval || 20_000, // Increased from 10_000
+      rebalanceCooldownMs: options?.coordinator?.rebalanceCooldown || 30_000,
     };
 
     this.messageTracker = {
@@ -98,4 +99,27 @@ export class AppConfig {
     }
     return defaultValue;
   }
+
+  // Add a method to calculate queue priority (Optional but useful)
+  calculateQueuePriority(queueName) {
+    // Default priority is 1
+    let priority = 1;
+
+    // Assign higher priority to specific queues
+    if (queueName.includes('high-priority')) {
+      priority = 5;
+    } else if (queueName.includes('payment')) {
+      priority = 4;
+    } else if (queueName.includes('order')) {
+      priority = 3;
+    } else if (queueName.includes('shipment')) {
+      priority = 2;
+    }
+
+    return priority;
+  }
 }
+
+const appConfig = new AppConfig();
+
+export default appConfig;

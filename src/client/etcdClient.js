@@ -1,12 +1,13 @@
 import getLogger from '../utils/logger.js';
 import { Etcd3 } from 'etcd3';
+import appConfig from '../utils/appConfig.js';
 
 const logger = getLogger('client/EtcdClient');
 
 /**
  * Client for interacting with etcd for distributed coordination
  */
-export default class EtcdClient {
+export class EtcdClient {
   /**
    * Create a new EtcdClient
    * @param {AppConfig} config - System configuration
@@ -173,3 +174,7 @@ export default class EtcdClient {
     }
   }
 }
+
+const etcdClient = new EtcdClient(appConfig);
+
+export default etcdClient;

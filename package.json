@@ -4,18 +4,19 @@
   "description": "Making cronjob with HA in high throughput environment",
   "author": "JonasKahn",
   "license": "MIT",
-  "main": "src/index.js",
+  "main": "src/main.js",
   "type": "module",
   "scripts": {
-    "dev": "nodemon -r dotenv/config src/index.js dotenv_config_debug=truepr",
-    "start": "node -r dotenv/config src/index.js",
-    "test:publisher": "node -r dotenv/config tests/integration/test-publisher.js",
+    "dev": "nodemon -r dotenv/config src/main.js dotenv_config_debug=truepr",
+    "start": "node -r dotenv/config src/main.js",
+    "test:publisher": "nodemon -r dotenv/config src/publish.js",
     "test": "NODE_OPTIONS=--experimental-vm-modules jest",
     "test:watch": "NODE_OPTIONS=--experimental-vm-modules jest --watch",
     "test:coverage": "NODE_OPTIONS=--experimental-vm-modules jest --coverage",
     "lint": "eslint .",
     "format": "prettier --write .",
-    "bin:redis:locator": "node -r dotenv/config sample/redis-key-locator.js"
+    "bin:redis:locator": "node -r dotenv/config tools/redis-key-locator.js",
+    "bin:etcd:clean": "node -r dotenv/config tools/etcd-key-cleaner.js"
   },
   "dependencies": {
     "amqplib": "^0.10.5",
